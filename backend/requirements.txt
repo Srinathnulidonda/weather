@@ -1,0 +1,13 @@
+flask
+flask-cors
+werkzeug
+requests
+urllib3
+python-dotenv
+structlog
+python-json-logger
+gunicorn
+gevent
+redis
+python-dateutil
+pytz

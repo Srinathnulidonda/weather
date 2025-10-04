@@ -61,8 +61,8 @@ def cache_with_expiry(expiry_seconds=300):
 
 WEATHER_CONDITION_MAP = {
     'Clear': {
-        'playlist': 'sunny happy vibes upbeat',
-        'playlist_ids': ['37i9dQZF1DXdPec7aLTmlC', '37i9dQZF1DX0UrRvztWcAU'],
+        'playlist': 'happy pop upbeat',
+        'playlist_ids': ['37i9dQZF1DXdPec7aLTmlC'],
         'sound': 'https://cdn.pixabay.com/audio/2022/03/22/audio_1e5d97d57a.mp3',
         'activities': ['Hiking', 'Picnic', 'Beach visit', 'Outdoor photography', 'Cycling', 'Running', 'Gardening', 'BBQ'],
         'mood': 'energetic',
@@ -72,8 +72,8 @@ WEATHER_CONDITION_MAP = {
         'health_tips': ['Stay hydrated', 'Use SPF 30+ sunscreen', 'Avoid peak sun hours (10am-4pm)']
     },
     'Clouds': {
-        'playlist': 'chill lounge relaxing ambient',
-        'playlist_ids': ['37i9dQZF1DX4WYpdgoIcn6', '37i9dQZF1DWTwnEm1IYyoj'],
+        'playlist': 'chill vibes relaxing',
+        'playlist_ids': ['37i9dQZF1DX4WYpdgoIcn6'],
         'sound': 'https://cdn.pixabay.com/audio/2021/08/09/audio_0625c1539c.mp3',
         'activities': ['Museum visit', 'Shopping', 'Outdoor walk', 'Coffee shop', 'Reading', 'Urban exploration'],
         'mood': 'relaxed',
@@ -83,8 +83,8 @@ WEATHER_CONDITION_MAP = {
         'health_tips': ['Perfect weather for outdoor activities', 'Good time for vitamin D', 'Stay active']
     },
     'Rain': {
-        'playlist': 'rainy day lofi jazz cozy',
-        'playlist_ids': ['37i9dQZF1DWXe9gFZP0gtP', '37i9dQZF1DX4PP3DA4J0N8'],
+        'playlist': 'rainy day jazz',
+        'playlist_ids': ['37i9dQZF1DWXe9gFZP0gtP'],
         'sound': 'https://cdn.pixabay.com/audio/2022/03/10/audio_c9054832ff.mp3',
         'activities': ['Movie marathon', 'Reading', 'Indoor cafe', 'Cooking', 'Art & crafts', 'Board games', 'Journaling'],
         'mood': 'cozy',
@@ -94,8 +94,8 @@ WEATHER_CONDITION_MAP = {
         'health_tips': ['Boost immune system', 'Stay warm and dry', 'Hot beverages recommended']
     },
     'Drizzle': {
-        'playlist': 'rainy day jazz peaceful',
-        'playlist_ids': ['37i9dQZF1DX4PP3DA4J0N8', '37i9dQZF1DX0SM0LYsmbMT'],
+        'playlist': 'peaceful piano',
+        'playlist_ids': ['37i9dQZF1DX4PP3DA4J0N8'],
         'sound': 'https://cdn.pixabay.com/audio/2022/03/10/audio_d0d5b89a6c.mp3',
         'activities': ['Umbrella walk', 'Photography', 'Bookstore visit', 'Tea time', 'Journaling', 'Meditation'],
         'mood': 'contemplative',
@@ -105,8 +105,8 @@ WEATHER_CONDITION_MAP = {
         'health_tips': ['Perfect for contemplation', 'Stay moderately active', 'Enjoy the calm']
     },
     'Thunderstorm': {
-        'playlist': 'epic cinematic dramatic intense',
-        'playlist_ids': ['37i9dQZF1DX4sWSpwq3LiO', '37i9dQZF1DX3Ogo9pFvBkY'],
+        'playlist': 'epic cinematic',
+        'playlist_ids': ['37i9dQZF1DX4sWSpwq3LiO'],
         'sound': 'https://cdn.pixabay.com/audio/2021/08/04/audio_12b0c7443c.mp3',
         'activities': ['Stay indoors', 'Board games', 'Movie watching', 'Baking', 'Reading', 'Puzzle solving'],
         'mood': 'intense',
@@ -116,8 +116,8 @@ WEATHER_CONDITION_MAP = {
         'health_tips': ['Stay indoors', 'Avoid electrical devices', 'Keep emergency supplies ready']
     },
     'Snow': {
-        'playlist': 'cozy winter christmas acoustic',
-        'playlist_ids': ['37i9dQZF1DX4E3UdUs7fUx', '37i9dQZF1DX0Yxoavh5qJV'],
+        'playlist': 'winter acoustic',
+        'playlist_ids': ['37i9dQZF1DX4E3UdUs7fUx'],
         'sound': 'https://cdn.pixabay.com/audio/2022/01/18/audio_12b2c26c8c.mp3',
         'activities': ['Build snowman', 'Hot chocolate', 'Winter photography', 'Sledding', 'Ice skating', 'Skiing'],
         'mood': 'peaceful',
@@ -127,8 +127,8 @@ WEATHER_CONDITION_MAP = {
         'health_tips': ['Layer up', 'Protect extremities', 'Stay warm and dry', 'Watch for ice']
     },
     'Mist': {
-        'playlist': 'ambient soundscapes ethereal',
-        'playlist_ids': ['37i9dQZF1DX3Ogo9pFvBkY', '37i9dQZF1DX4PP3DA4J0N8'],
+        'playlist': 'ambient soundscapes',
+        'playlist_ids': ['37i9dQZF1DX3Ogo9pFvBkY'],
         'sound': 'https://cdn.pixabay.com/audio/2021/10/07/audio_bb630cc098.mp3',
         'activities': ['Meditation', 'Yoga', 'Gentle walk', 'Spa day', 'Relaxation', 'Mindfulness'],
         'mood': 'mysterious',
@@ -138,8 +138,8 @@ WEATHER_CONDITION_MAP = {
         'health_tips': ['Drive carefully', 'Use visibility aids', 'Stay aware of surroundings']
     },
     'Fog': {
-        'playlist': 'mysterious calm ambient',
-        'playlist_ids': ['37i9dQZF1DX3Ogo9pFvBkY', '37i9dQZF1DWZd79rJ6a7lp'],
+        'playlist': 'calm meditation',
+        'playlist_ids': ['37i9dQZF1DWZd79rJ6a7lp'],
         'sound': 'https://cdn.pixabay.com/audio/2021/10/07/audio_bb630cc098.mp3',
         'activities': ['Indoor activities', 'Reading', 'Puzzle solving', 'Tea ceremony', 'Creative writing'],
         'mood': 'calm',
@@ -149,8 +149,8 @@ WEATHER_CONDITION_MAP = {
         'health_tips': ['Reduce outdoor activities', 'Use air purifiers indoors', 'Stay hydrated']
     },
     'Haze': {
-        'playlist': 'dreamy indie alternative',
-        'playlist_ids': ['37i9dQZF1DX2sUQwD7tbmL', '37i9dQZF1DX3YSRoSdA634'],
+        'playlist': 'indie folk',
+        'playlist_ids': ['37i9dQZF1DX2sUQwD7tbmL'],
         'sound': 'https://cdn.pixabay.com/audio/2021/08/09/audio_0625c1539c.mp3',
         'activities': ['Indoor photography', 'Creative writing', 'Music listening', 'Painting', 'Creative projects'],
         'mood': 'dreamy',
@@ -160,8 +160,8 @@ WEATHER_CONDITION_MAP = {
         'health_tips': ['Limit outdoor exposure', 'Use air filters', 'Stay hydrated', 'Protect respiratory health']
     },
     'Smoke': {
-        'playlist': 'deep focus concentration',
-        'playlist_ids': ['37i9dQZF1DWZeKCadgRdKQ', '37i9dQZF1DX3PFzdbtx1Us'],
+        'playlist': 'deep focus',
+        'playlist_ids': ['37i9dQZF1DWZeKCadgRdKQ'],
         'sound': 'https://cdn.pixabay.com/audio/2021/10/07/audio_bb630cc098.mp3',
         'activities': ['Stay indoors', 'Air purification', 'Indoor exercise', 'Work from home', 'Rest'],
         'mood': 'focused',
@@ -171,8 +171,8 @@ WEATHER_CONDITION_MAP = {
         'health_tips': ['Stay indoors', 'Use air purifiers', 'Wear N95 masks if going out', 'Monitor air quality']
     },
     'Dust': {
-        'playlist': 'desert blues atmospheric',
-        'playlist_ids': ['37i9dQZF1DWZd79rJ6a7lp', '37i9dQZF1DX3Ogo9pFvBkY'],
+        'playlist': 'atmospheric ambient',
+        'playlist_ids': ['37i9dQZF1DWZd79rJ6a7lp'],
         'sound': 'https://cdn.pixabay.com/audio/2021/08/09/audio_0625c1539c.mp3',
         'activities': ['Indoor activities', 'Museums', 'Indoor sports', 'Movie theaters'],
         'mood': 'cautious',
@@ -182,8 +182,8 @@ WEATHER_CONDITION_MAP = {
         'health_tips': ['Wear protective masks', 'Seal windows', 'Use air purifiers', 'Stay hydrated']
     },
     'Tornado': {
-        'playlist': 'intense classical epic',
-        'playlist_ids': ['37i9dQZF1DX4sWSpwq3LiO', '37i9dQZF1DWZBCBq9YLx6e'],
+        'playlist': 'intense classical',
+        'playlist_ids': ['37i9dQZF1DX4sWSpwq3LiO'],
         'sound': 'https://cdn.pixabay.com/audio/2021/08/04/audio_12b0c7443c.mp3',
         'activities': ['Seek shelter immediately', 'Emergency preparedness', 'Safety first'],
         'mood': 'urgent',
@@ -211,20 +211,10 @@ WEATHER_FUN_FACTS = [
     "A single cumulus cloud can weigh more than 1 million pounds due to water content",
     "Weather satellites orbit Earth at speeds of about 17,000 mph",
     "The hottest place on Earth is the Lut Desert in Iran, reaching 159.3°F",
-    "A single hurricane can release energy equivalent to 10,000 nuclear bombs",
+    "A hurricane releases energy equivalent to 10,000 nuclear bombs",
     "The wettest place on Earth is Mawsynram, India, receiving 467 inches of rain annually",
     "Snowflakes always have six sides due to the molecular structure of ice crystals",
     "The largest hailstone ever recorded was 8 inches in diameter and weighed nearly 2 pounds",
-    "Tornadoes can have wind speeds exceeding 300 mph",
-    "The eye of a hurricane is typically 20-40 miles wide and completely calm",
-    "Diamond dust is a type of precipitation that occurs when ice crystals fall from a clear sky",
-    "Ball lightning is a rare weather phenomenon that scientists still don't fully understand",
-    "The smell of rain is called 'petrichor' and is caused by oils released from plants and bacteria",
-    "Watermelon snow is a real phenomenon caused by algae that makes snow appear pink or red",
-    "A full rainbow is actually a complete circle, but ground observers only see the arc",
-    "Mammatus clouds look like pouches hanging from the sky and often appear before severe storms",
-    "The hottest temperature ever recorded in inhabited areas was 129.2°F in Kuwait in 2016",
-    "Virga is rain that evaporates before reaching the ground, creating curtain-like formations"
 ]
 
 GLOBAL_CITIES = [
@@ -234,39 +224,7 @@ GLOBAL_CITIES = [
     'Istanbul,TR', 'Seoul,KR', 'Mexico City,MX', 'Moscow,RU', 'Los Angeles,US',
     'Amsterdam,NL', 'Vienna,AT', 'Prague,CZ', 'Buenos Aires,AR', 'Cape Town,ZA',
     'Beijing,CN', 'Hong Kong,HK', 'Lisbon,PT', 'Dublin,IE', 'Copenhagen,DK',
-    'Stockholm,SE', 'Oslo,NO', 'Helsinki,FI', 'Athens,GR', 'Zurich,CH',
-    'Brussels,BE', 'Warsaw,PL', 'Budapest,HU', 'Kuala Lumpur,MY', 'Jakarta,ID',
-    'Manila,PH', 'Hanoi,VN', 'Tehran,IR', 'Baghdad,IQ', 'Riyadh,SA',
-    'Lima,PE', 'Bogota,CO', 'Santiago,CL', 'Caracas,VE', 'Havana,CU'
 ]
-
-CURATED_SPOTIFY_PLAYLISTS = {
-    'sunny': [
-        {'name': 'Sunny Day Vibes', 'query': 'sunny happy upbeat pop', 'description': 'Perfect for bright sunny days'},
-        {'name': 'Beach Essentials', 'query': 'beach tropical summer', 'description': 'Summer beach anthems'},
-        {'name': 'Feel Good Energy', 'query': 'feel good energy positive', 'description': 'Uplifting energy boosters'}
-    ],
-    'rainy': [
-        {'name': 'Rainy Day Lofi', 'query': 'lofi hip hop chill beats', 'description': 'Chill beats for rainy days'},
-        {'name': 'Jazz in the Rain', 'query': 'jazz piano relaxing', 'description': 'Smooth jazz for stormy weather'},
-        {'name': 'Cozy Acoustic', 'query': 'acoustic indie folk', 'description': 'Warm acoustic melodies'}
-    ],
-    'cloudy': [
-        {'name': 'Chill Vibes', 'query': 'chill vibes ambient', 'description': 'Relaxing ambient sounds'},
-        {'name': 'Downtempo Electronica', 'query': 'downtempo electronic chill', 'description': 'Electronic chill music'},
-        {'name': 'Indie Essentials', 'query': 'indie alternative rock', 'description': 'Indie rock favorites'}
-    ],
-    'snow': [
-        {'name': 'Winter Wonderland', 'query': 'winter christmas acoustic', 'description': 'Cozy winter sounds'},
-        {'name': 'Fireside Sessions', 'query': 'acoustic guitar instrumental', 'description': 'Warm acoustic melodies'},
-        {'name': 'Peaceful Piano', 'query': 'peaceful piano classical', 'description': 'Calm piano compositions'}
-    ],
-    'storm': [
-        {'name': 'Epic Soundtracks', 'query': 'epic cinematic orchestral', 'description': 'Dramatic orchestral music'},
-        {'name': 'Intense Focus', 'query': 'intense focus concentration', 'description': 'Deep concentration music'},
-        {'name': 'Dark Academia', 'query': 'classical dark orchestral', 'description': 'Dark classical themes'}
-    ]
-}
 
 def get_moon_phase():
     year = datetime.now().year
@@ -298,11 +256,15 @@ def get_moon_phase():
     
     return {'phase': phases[b], 'emoji': emojis[b], 'illumination': round(jd * 100)}
 
-@lru_cache(maxsize=10)
+spotify_token_cache = {'token': None, 'expires_at': 0}
+
 def get_spotify_token():
     if not SPOTIFY_CLIENT_ID or not SPOTIFY_CLIENT_SECRET:
         logger.warning("Spotify credentials not configured")
         return None
+    
+    if spotify_token_cache['token'] and time.time() < spotify_token_cache['expires_at']:
+        return spotify_token_cache['token']
     
     auth_string = f"{SPOTIFY_CLIENT_ID}:{SPOTIFY_CLIENT_SECRET}"
     auth_bytes = auth_string.encode('utf-8')
@@ -319,7 +281,11 @@ def get_spotify_token():
         response = requests.post(url, headers=headers, data=data, timeout=10)
         response.raise_for_status()
         token_data = response.json()
-        return token_data.get('access_token')
+        
+        spotify_token_cache['token'] = token_data.get('access_token')
+        spotify_token_cache['expires_at'] = time.time() + token_data.get('expires_in', 3600) - 60
+        
+        return spotify_token_cache['token']
     except Exception as e:
         logger.error(f"Spotify authentication failed: {e}")
         return None
@@ -327,30 +293,50 @@ def get_spotify_token():
 @cache_with_expiry(expiry_seconds=300)
 def get_location_from_ip(ip_address=None):
     try:
+        if not ip_address or ip_address == '127.0.0.1' or ip_address.startswith('192.168'):
+            ip_address = None
+        
         if IPGEOLOCATION_API_KEY:
             url = f"https://api.ipgeolocation.io/ipgeo?apiKey={IPGEOLOCATION_API_KEY}"
             if ip_address:
                 url += f"&ip={ip_address}"
             response = requests.get(url, timeout=5)
             data = response.json()
+            
+            lat = float(data.get('latitude', 0))
+            lon = float(data.get('longitude', 0))
+            
+            if lat == 0 and lon == 0:
+                raise ValueError("Invalid coordinates")
+            
             return {
                 'city': data.get('city', 'Unknown'),
                 'country': data.get('country_name', 'Unknown'),
-                'lat': float(data.get('latitude', 0)),
-                'lon': float(data.get('longitude', 0)),
-                'timezone': data.get('time_zone', {}).get('name', 'UTC'),
+                'lat': lat,
+                'lon': lon,
+                'timezone': data.get('time_zone', {}).get('name', 'UTC') if isinstance(data.get('time_zone'), dict) else 'UTC',
                 'state': data.get('state_prov', ''),
                 'zipcode': data.get('zipcode', '')
             }
         else:
-            url = f"http://ip-api.com/json/{ip_address}" if ip_address else "http://ip-api.com/json/"
+            url = f"http://ip-api.com/json/{ip_address}?fields=status,message,country,countryCode,region,regionName,city,zip,lat,lon,timezone" if ip_address else "http://ip-api.com/json/?fields=status,message,country,countryCode,region,regionName,city,zip,lat,lon,timezone"
             response = requests.get(url, timeout=5)
             data = response.json()
+            
+            if data.get('status') == 'fail':
+                raise ValueError(data.get('message', 'Geolocation failed'))
+            
+            lat = data.get('lat', 0)
+            lon = data.get('lon', 0)
+            
+            if lat == 0 and lon == 0:
+                raise ValueError("Invalid coordinates")
+            
             return {
                 'city': data.get('city', 'Unknown'),
                 'country': data.get('country', 'Unknown'),
-                'lat': data.get('lat', 0),
-                'lon': data.get('lon', 0),
+                'lat': lat,
+                'lon': lon,
                 'timezone': data.get('timezone', 'UTC'),
                 'state': data.get('regionName', ''),
                 'zipcode': data.get('zip', '')
@@ -358,13 +344,13 @@ def get_location_from_ip(ip_address=None):
     except Exception as e:
         logger.error(f"IP geolocation failed: {e}")
         return {
-            'city': 'New York',
-            'country': 'USA',
-            'lat': 40.7128,
-            'lon': -74.0060,
-            'timezone': 'America/New_York',
-            'state': 'New York',
-            'zipcode': '10001'
+            'city': 'London',
+            'country': 'United Kingdom',
+            'lat': 51.5074,
+            'lon': -0.1278,
+            'timezone': 'Europe/London',
+            'state': 'England',
+            'zipcode': ''
         }
 
 def get_greeting(timezone='UTC'):
@@ -512,6 +498,22 @@ def get_best_time_today(forecast_data):
     
     return best_time
 
+@app.route('/', methods=['GET'])
+def home():
+    return jsonify({
+        'service': 'SkyVibe Weather API',
+        'version': '2.0.0',
+        'status': 'running',
+        'documentation': '/api/docs',
+        'endpoints': {
+            'health': '/health',
+            'location': '/api/location/auto',
+            'weather': '/api/weather/current',
+            'forecast': '/api/weather/forecast',
+            'explore': '/api/weather/explore'
+        }
+    }), 200
+
 @app.route('/health', methods=['GET'])
 def health_check():
     return jsonify({
@@ -579,8 +581,8 @@ def get_current_weather():
         result = {
             'success': True,
             'location': {
-                'name': data.get('name'),
-                'country': data['sys'].get('country'),
+                'name': data.get('name', 'Unknown'),
+                'country': data['sys'].get('country', 'Unknown'),
                 'coordinates': {
                     'lat': data['coord'].get('lat'),
                     'lon': data['coord'].get('lon')
@@ -916,8 +918,6 @@ def explore_random_weather():
 
 @app.route('/api/insights/fun-fact', methods=['GET'])
 def get_fun_fact():
-    category = request.args.get('category', 'all')
-    
     return jsonify({
         'success': True,
         'fact': random.choice(WEATHER_FUN_FACTS),
@@ -964,18 +964,7 @@ def get_spotify_playlists():
     limit = request.args.get('limit', 5, type=int)
     
     weather_config = WEATHER_CONDITION_MAP.get(weather, WEATHER_CONDITION_MAP['Clear'])
-    
-    weather_category = 'sunny'
-    if weather in ['Rain', 'Drizzle']:
-        weather_category = 'rainy'
-    elif weather in ['Clouds', 'Mist', 'Fog', 'Haze']:
-        weather_category = 'cloudy'
-    elif weather == 'Snow':
-        weather_category = 'snow'
-    elif weather in ['Thunderstorm', 'Tornado']:
-        weather_category = 'storm'
-    
-    curated = CURATED_SPOTIFY_PLAYLISTS.get(weather_category, CURATED_SPOTIFY_PLAYLISTS['sunny'])
+    playlist_query = weather_config['playlist']
     
     token = get_spotify_token()
     
@@ -984,51 +973,47 @@ def get_spotify_playlists():
             'success': False,
             'message': 'Spotify service unavailable',
             'weather': weather,
-            'mood': weather_config['mood'],
-            'curated_suggestions': curated
+            'mood': weather_config['mood']
         }), 200
     
     all_playlists = []
     
-    for playlist_info in curated:
-        search_url = f"https://api.spotify.com/v1/search?q={playlist_info['query']}&type=playlist&limit=2"
-        headers = {"Authorization": f"Bearer {token}"}
+    search_url = f"https://api.spotify.com/v1/search?q={playlist_query}&type=playlist&limit={limit}"
+    headers = {"Authorization": f"Bearer {token}"}
+    
+    try:
+        response = requests.get(search_url, headers=headers, timeout=10)
+        response.raise_for_status()
+        data = response.json()
         
-        try:
-            response = requests.get(search_url, headers=headers, timeout=10)
-            response.raise_for_status()
-            data = response.json()
-            
-            if data and 'playlists' in data and data['playlists'] and 'items' in data['playlists']:
-                for item in data['playlists']['items'][:2]:
+        if data and 'playlists' in data and data['playlists'] and 'items' in data['playlists'] and data['playlists']['items']:
+            for item in data['playlists']['items'][:limit]:
+                if item:
                     all_playlists.append({
-                        'name': item['name'],
-                        'description': item.get('description', playlist_info['description']),
-                        'url': item['external_urls']['spotify'],
-                        'image': item['images'][0]['url'] if item['images'] else None,
-                        'tracks': item['tracks']['total'],
-                        'owner': item['owner']['display_name'],
-                        'category': weather_category
+                        'name': item.get('name', 'Unknown Playlist'),
+                        'description': item.get('description', f'Curated for {weather_config["mood"]} mood'),
+                        'url': item.get('external_urls', {}).get('spotify', '#'),
+                        'image': item.get('images', [{}])[0].get('url') if item.get('images') else None,
+                        'tracks': item.get('tracks', {}).get('total', 0),
+                        'owner': item.get('owner', {}).get('display_name', 'Spotify'),
+                        'category': weather.lower()
                     })
-        except Exception as e:
-            logger.error(f"Spotify search error for {playlist_info['query']}: {e}")
-            continue
+    except Exception as e:
+        logger.error(f"Spotify search error: {e}")
     
     if not all_playlists:
         return jsonify({
             'success': False,
             'message': 'No playlists found',
             'weather': weather,
-            'mood': weather_config['mood'],
-            'curated_suggestions': curated
+            'mood': weather_config['mood']
         }), 200
     
     return jsonify({
         'success': True,
         'weather': weather,
         'mood': weather_config['mood'],
-        'category': weather_category,
-        'playlists': all_playlists[:limit],
+        'playlists': all_playlists,
         'total_found': len(all_playlists)
     }), 200
 
@@ -1092,8 +1077,8 @@ def get_weather_summary():
         summary = {
             'success': True,
             'location': {
-                'name': current_data['name'],
-                'country': current_data['sys']['country']
+                'name': current_data.get('name', 'Unknown'),
+                'country': current_data['sys'].get('country', 'Unknown')
             },
             'current': {
                 'temperature': round(current_data['main']['temp'], 1),
@@ -1141,40 +1126,6 @@ def get_weather_summary():
         logger.error(f"Summary generation failed: {e}")
         return jsonify({'error': 'Summary unavailable', 'success': False}), 503
 
-@app.route('/api/preferences/save', methods=['POST'])
-def save_preferences():
-    data = request.get_json()
-    
-    if 'session' not in globals():
-        session['preferences'] = {}
-    
-    session['preferences'] = {
-        'units': data.get('units', 'metric'),
-        'favorite_locations': data.get('favorite_locations', []),
-        'theme': data.get('theme', 'auto'),
-        'notifications': data.get('notifications', True)
-    }
-    
-    return jsonify({
-        'success': True,
-        'message': 'Preferences saved',
-        'preferences': session.get('preferences', {})
-    }), 200
-
-@app.route('/api/preferences/get', methods=['GET'])
-def get_preferences():
-    preferences = session.get('preferences', {
-        'units': 'metric',
-        'favorite_locations': [],
-        'theme': 'auto',
-        'notifications': True
-    })
-    
-    return jsonify({
-        'success': True,
-        'preferences': preferences
-    }), 200
-
 @app.errorhandler(404)
 def not_found(error):
     return jsonify({
@@ -1182,6 +1133,8 @@ def not_found(error):
         'error': 'Endpoint not found',
         'code': 404,
         'available_endpoints': [
+            '/',
+            '/health',
             '/api/location/auto',
             '/api/weather/current',
             '/api/weather/forecast',

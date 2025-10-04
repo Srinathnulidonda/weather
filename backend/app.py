@@ -13,7 +13,7 @@ import base64
 app = Flask(__name__)
 CORS(app, resources={r"/api/*": {"origins": "*"}})
 
-app.config['SECRET_KEY'] = os.getenv('SECRET_KEY', 'production-secret-key')
+app.config['SECRET_KEY'] = os.getenv('SECRET_KEY', 'dev-7f4d8e3a9b2c5f1e6d0a8c7b4e2f9d3a5c8b1e4d7a0f3e6c9b2d5a8f1c4e7ba8f7e3d9c2b5a1e6f0d8c7b4e2f9d3a5c8b1e4d7a0f3e6c9b2d5a8f1c4e7b0d3a9')
 app.config['JSON_SORT_KEYS'] = False
 
 limiter = Limiter(
@@ -29,10 +29,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-OPENWEATHER_API_KEY = os.getenv('OPENWEATHER_API_KEY')
-SPOTIFY_CLIENT_ID = os.getenv('SPOTIFY_CLIENT_ID')
-SPOTIFY_CLIENT_SECRET = os.getenv('SPOTIFY_CLIENT_SECRET')
-IPGEOLOCATION_API_KEY = os.getenv('IPGEOLOCATION_API_KEY', '')
+OPENWEATHER_API_KEY = os.getenv('OPENWEATHER_API_KEY','e597f0454b011ac1ad8a410141ca2ff6')
+SPOTIFY_CLIENT_ID = os.getenv('SPOTIFY_CLIENT_ID','eb71667657e542caaeb0d3c7a57c5026')
+SPOTIFY_CLIENT_SECRET = os.getenv('SPOTIFY_CLIENT_SECRET','f313d98a2db6429297534ed4611f4085')
+IPGEOLOCATION_API_KEY = os.getenv('IPGEOLOCATION_API_KEY', '292343e8-01b1-4bc6-9f54-82efda06f81e')
 
 WEATHER_CONDITION_MAP = {
     'Clear': {

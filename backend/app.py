@@ -2,1317 +2,1806 @@
 import os
 import json
 import random
-import logging
-from datetime import datetime, timedelta, timezone
-from functools import wraps
-from typing import Dict, List, Optional, Any
-from dataclasses import dataclass
-import base64
 import hashlib
-import time
-from collections import defaultdict
-
+import secrets
 import requests
-from flask import Flask, request, jsonify, g
+import redis
+import time
+import base64
+import uuid
+import traceback
+from datetime import datetime, timedelta, timezone
+from functools import wraps, lru_cache
+from typing import Dict, List, Optional, Any, Tuple
+from collections import defaultdict, deque
+from contextlib import contextmanager
+from dataclasses import dataclass, asdict
+from enum import Enum
+import threading
+import queue
+import logging
+import sys
+
+from flask import Flask, request, jsonify, g, Response
 from flask_cors import CORS
 from flask_sqlalchemy import SQLAlchemy
-from sqlalchemy import and_, or_, desc
-from sqlalchemy.dialects.postgresql import JSON
+from flask_migrate import Migrate
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
+from flask_caching import Cache
+from marshmallow import Schema, fields, validate, ValidationError, pre_load, post_dump
+from sqlalchemy import Column, Integer, String, Float, DateTime, Boolean, JSON, Text, ForeignKey, Index, UniqueConstraint, event, and_, or_, func
+from sqlalchemy.orm import relationship, validates, deferred, joinedload, selectinload
+from sqlalchemy.dialects.postgresql import UUID, JSONB, ARRAY, TSVECTOR
+from sqlalchemy.ext.hybrid import hybrid_property
+from sqlalchemy.pool import NullPool, QueuePool
 from werkzeug.security import generate_password_hash, check_password_hash
+from werkzeug.middleware.proxy_fix import ProxyFix
 import jwt
+import sentry_sdk
+from sentry_sdk.integrations.flask import FlaskIntegration
+from prometheus_flask_exporter import PrometheusMetrics
 
-# Initialize Flask app
-app = Flask(__name__)
-
-# Configuration
-app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'dev-secret-key-change-in-production')
-app.config['SQLALCHEMY_DATABASE_URI'] = os.environ.get('DATABASE_URL', 'postgresql://localhost/weather_visualizer')
-if app.config['SQLALCHEMY_DATABASE_URI'].startswith('postgres://'):
-    app.config['SQLALCHEMY_DATABASE_URI'] = app.config['SQLALCHEMY_DATABASE_URI'].replace('postgres://', 'postgresql://', 1)
-app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
-app.config['SQLALCHEMY_ENGINE_OPTIONS'] = {
-    'pool_size': 10,
-    'pool_recycle': 3600,
-    'pool_pre_ping': True,
-}
-
-# Initialize extensions
-db = SQLAlchemy(app)
-CORS(app, origins="*", supports_credentials=True)
-
-# Configure logging
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.handlers.RotatingFileHandler('app.log', maxBytes=10485760, backupCount=5)
+    ]
+)
 logger = logging.getLogger(__name__)
 
-# Environment variables
-OPENWEATHER_API_KEY = os.environ.get('OPENWEATHER_API_KEY')
-SPOTIFY_CLIENT_ID = os.environ.get('SPOTIFY_CLIENT_ID')
-SPOTIFY_CLIENT_SECRET = os.environ.get('SPOTIFY_CLIENT_SECRET')
-IPINFO_TOKEN = os.environ.get('IPINFO_TOKEN', '')
-FIREBASE_SERVER_KEY = os.environ.get('FIREBASE_SERVER_KEY', '')
-ONESIGNAL_APP_ID = os.environ.get('ONESIGNAL_APP_ID', '')
-ONESIGNAL_API_KEY = os.environ.get('ONESIGNAL_API_KEY', '')
+class Config:
+    SECRET_KEY = os.environ.get('SECRET_KEY', secrets.token_hex(32))
+    SQLALCHEMY_DATABASE_URI = os.environ.get('DATABASE_URL', '').replace('postgres://', 'postgresql://')
+    SQLALCHEMY_ENGINE_OPTIONS = {
+        'pool_size': 20,
+        'pool_recycle': 3600,
+        'pool_pre_ping': True,
+        'max_overflow': 40,
+        'echo_pool': False
+    }
+    SQLALCHEMY_TRACK_MODIFICATIONS = False
+    REDIS_URL = os.environ.get('REDIS_URL', 'redis://localhost:6379/0')
+    CACHE_TYPE = 'redis'
+    CACHE_REDIS_URL = os.environ.get('REDIS_URL', 'redis://localhost:6379/1')
+    CACHE_DEFAULT_TIMEOUT = 300
+    OPENWEATHER_API_KEY = os.environ.get('OPENWEATHER_API_KEY')
+    SPOTIFY_CLIENT_ID = os.environ.get('SPOTIFY_CLIENT_ID')
+    SPOTIFY_CLIENT_SECRET = os.environ.get('SPOTIFY_CLIENT_SECRET')
+    IPAPI_KEY = os.environ.get('IPAPI_KEY')
+    FIREBASE_SERVER_KEY = os.environ.get('FIREBASE_SERVER_KEY')
+    SENTRY_DSN = os.environ.get('SENTRY_DSN')
+    ENVIRONMENT = os.environ.get('ENVIRONMENT', 'production')
+    API_VERSION = 'v1'
+    MAX_CONTENT_LENGTH = 16 * 1024 * 1024
+    JWT_EXPIRATION_DAYS = 7
+    JWT_REFRESH_EXPIRATION_DAYS = 30
+    BCRYPT_LOG_ROUNDS = 12
+    RATE_LIMIT_STORAGE_URL = os.environ.get('REDIS_URL', 'redis://localhost:6379/2')
 
-# Rate limiting storage
-rate_limit_storage = defaultdict(list)
+app = Flask(__name__)
+app.config.from_object(Config)
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=1)
 
-# ======================= DATABASE MODELS =======================
+db = SQLAlchemy(app)
+migrate = Migrate(app, db)
+cache = Cache(app)
+metrics = PrometheusMetrics(app)
+
+CORS(app, 
+     origins=os.environ.get('ALLOWED_ORIGINS', '*').split(','),
+     supports_credentials=True,
+     max_age=3600,
+     methods=['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+     allow_headers=['Content-Type', 'Authorization', 'X-Request-ID', 'X-Client-Version'])
+
+limiter = Limiter(
+    app,
+    key_func=get_remote_address,
+    default_limits=["200 per day", "50 per hour"],
+    storage_uri=app.config['RATE_LIMIT_STORAGE_URL']
+)
+
+if app.config['SENTRY_DSN']:
+    sentry_sdk.init(
+        dsn=app.config['SENTRY_DSN'],
+        integrations=[FlaskIntegration()],
+        traces_sample_rate=0.1,
+        environment=app.config['ENVIRONMENT']
+    )
+
+redis_client = redis.from_url(app.config['REDIS_URL'], decode_responses=True)
+
+class WeatherCondition(Enum):
+    CLEAR = 'clear'
+    CLOUDS = 'clouds'
+    RAIN = 'rain'
+    DRIZZLE = 'drizzle'
+    THUNDERSTORM = 'thunderstorm'
+    SNOW = 'snow'
+    MIST = 'mist'
+    FOG = 'fog'
+    HAZE = 'haze'
+    DUST = 'dust'
+    SAND = 'sand'
+    ASH = 'ash'
+    SQUALL = 'squall'
+    TORNADO = 'tornado'
+
+class AlertSeverity(Enum):
+    LOW = 'low'
+    MEDIUM = 'medium'
+    HIGH = 'high'
+    CRITICAL = 'critical'
+
+class TriggerCondition(Enum):
+    TEMP_BELOW = 'temp_below'
+    TEMP_ABOVE = 'temp_above'
+    WIND_ABOVE = 'wind_above'
+    RAIN_STARTS = 'rain_starts'
+    HUMIDITY_ABOVE = 'humidity_above'
+    UV_ABOVE = 'uv_above'
+    PRESSURE_DROPS = 'pressure_drops'
+
+@dataclass
+class WeatherData:
+    temperature: float
+    feels_like: float
+    humidity: int
+    pressure: int
+    wind_speed: float
+    wind_direction: int
+    visibility: float
+    uv_index: float
+    condition: str
+    description: str
+    icon: str
+    clouds: int
+    rain: Optional[float] = None
+    snow: Optional[float] = None
+
+@dataclass
+class LocationData:
+    latitude: float
+    longitude: float
+    city: str
+    country: str
+    timezone: Optional[str] = None
+    region: Optional[str] = None
+
+class CircuitBreaker:
+    def __init__(self, failure_threshold=5, recovery_timeout=60, expected_exception=Exception):
+        self.failure_threshold = failure_threshold
+        self.recovery_timeout = recovery_timeout
+        self.expected_exception = expected_exception
+        self.failure_count = 0
+        self.last_failure_time = None
+        self.state = 'closed'
+        self._lock = threading.Lock()
+
+    def call(self, func, *args, **kwargs):
+        with self._lock:
+            if self.state == 'open':
+                if datetime.now().timestamp() - self.last_failure_time > self.recovery_timeout:
+                    self.state = 'half-open'
+                else:
+                    raise Exception('Circuit breaker is open')
+
+        try:
+            result = func(*args, **kwargs)
+            with self._lock:
+                if self.state == 'half-open':
+                    self.state = 'closed'
+                    self.failure_count = 0
+            return result
+        except self.expected_exception as e:
+            with self._lock:
+                self.failure_count += 1
+                self.last_failure_time = datetime.now().timestamp()
+                if self.failure_count >= self.failure_threshold:
+                    self.state = 'open'
+            raise e
+
+weather_api_breaker = CircuitBreaker(failure_threshold=3, recovery_timeout=30)
+spotify_api_breaker = CircuitBreaker(failure_threshold=3, recovery_timeout=60)
 
 class User(db.Model):
     __tablename__ = 'users'
+    __table_args__ = (
+        Index('idx_user_email', 'email'),
+        Index('idx_user_username', 'username'),
+        Index('idx_user_active', 'is_active'),
+        {'schema': 'public'}
+    )
     
-    id = db.Column(db.Integer, primary_key=True)
-    email = db.Column(db.String(120), unique=True, nullable=False)
-    username = db.Column(db.String(80), unique=True, nullable=False)
-    password_hash = db.Column(db.String(255))
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
-    last_active = db.Column(db.DateTime, default=datetime.utcnow)
-    streak_count = db.Column(db.Integer, default=0)
-    last_streak_date = db.Column(db.Date)
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    email = Column(String(255), unique=True, nullable=False)
+    username = Column(String(80), unique=True, nullable=False)
+    password_hash = Column(String(255), nullable=False)
+    is_active = Column(Boolean, default=True, nullable=False)
+    is_verified = Column(Boolean, default=False, nullable=False)
+    is_premium = Column(Boolean, default=False, nullable=False)
     
-    # Preferences
-    preferences = db.Column(JSON, default=lambda: {
-        'units': {'temp': 'celsius', 'speed': 'kmh'},
-        'theme': 'light',
-        'language': 'en',
-        'favorite_locations': [],
-        'weather_mood': 'neutral',
-        'notifications_enabled': True,
-        'alert_triggers': []
-    })
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False)
+    updated_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
+    last_active = Column(DateTime(timezone=True))
+    email_verified_at = Column(DateTime(timezone=True))
     
-    # Relations
-    alerts = db.relationship('Alert', backref='user', lazy='dynamic', cascade='all, delete-orphan')
-    logs = db.relationship('WeatherLog', backref='user', lazy='dynamic', cascade='all, delete-orphan')
+    streak_count = Column(Integer, default=0, nullable=False)
+    max_streak = Column(Integer, default=0, nullable=False)
+    total_checks = Column(Integer, default=0, nullable=False)
+    
+    preferences = Column(JSONB, default=dict, nullable=False)
+    metadata = Column(JSONB, default=dict)
+    feature_flags = Column(JSONB, default=dict)
+    
+    notification_token = Column(String(500))
+    api_key = Column(String(64), unique=True)
+    refresh_token = Column(String(500))
+    
+    alerts = relationship('WeatherAlert', back_populates='user', lazy='dynamic', cascade='all, delete-orphan')
+    logs = relationship('WeatherLog', back_populates='user', lazy='dynamic', cascade='all, delete-orphan')
+    triggers = relationship('CustomTrigger', back_populates='user', lazy='dynamic', cascade='all, delete-orphan')
+    sessions = relationship('UserSession', back_populates='user', lazy='dynamic', cascade='all, delete-orphan')
+    
+    @validates('email')
+    def validate_email(self, key, email):
+        if not email or '@' not in email:
+            raise ValueError('Invalid email address')
+        return email.lower()
+    
+    @hybrid_property
+    def is_streak_active(self):
+        if not self.last_active:
+            return False
+        return (datetime.now(timezone.utc) - self.last_active).days <= 1
+    
+    def set_password(self, password):
+        self.password_hash = generate_password_hash(password, method='pbkdf2:sha256', salt_length=16)
+    
+    def check_password(self, password):
+        return check_password_hash(self.password_hash, password)
+    
+    def generate_api_key(self):
+        self.api_key = secrets.token_urlsafe(48)
+        return self.api_key
     
     def update_streak(self):
-        today = datetime.now(timezone.utc).date()
-        if self.last_streak_date:
-            if self.last_streak_date == today:
-                return  # Already updated today
-            elif self.last_streak_date == today - timedelta(days=1):
+        now = datetime.now(timezone.utc)
+        if self.last_active:
+            days_diff = (now.date() - self.last_active.date()).days
+            if days_diff == 1:
                 self.streak_count += 1
-            else:
+                self.max_streak = max(self.max_streak, self.streak_count)
+            elif days_diff > 1:
                 self.streak_count = 1
         else:
             self.streak_count = 1
-        self.last_streak_date = today
-        self.last_active = datetime.utcnow()
+        self.last_active = now
+        self.total_checks += 1
 
-class Alert(db.Model):
-    __tablename__ = 'alerts'
+class UserSession(db.Model):
+    __tablename__ = 'user_sessions'
+    __table_args__ = (
+        Index('idx_session_token', 'token'),
+        Index('idx_session_user', 'user_id'),
+        Index('idx_session_expires', 'expires_at'),
+        {'schema': 'public'}
+    )
     
-    id = db.Column(db.Integer, primary_key=True)
-    user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False)
-    type = db.Column(db.String(50))  # temp_drop, rain_start, wind_alert, etc.
-    condition = db.Column(JSON)  # {'temp': '<15', 'wind': '>50', etc.}
-    location = db.Column(db.String(100))
-    enabled = db.Column(db.Boolean, default=True)
-    last_triggered = db.Column(db.DateTime)
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id = Column(UUID(as_uuid=True), ForeignKey('users.id'), nullable=False)
+    token = Column(String(500), unique=True, nullable=False)
+    refresh_token = Column(String(500), unique=True)
+    
+    ip_address = Column(String(45))
+    user_agent = Column(String(500))
+    device_id = Column(String(255))
+    
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    expires_at = Column(DateTime(timezone=True))
+    last_used = Column(DateTime(timezone=True))
+    
+    is_active = Column(Boolean, default=True)
+    
+    user = relationship('User', back_populates='sessions')
+
+class WeatherAlert(db.Model):
+    __tablename__ = 'weather_alerts'
+    __table_args__ = (
+        Index('idx_alert_user', 'user_id'),
+        Index('idx_alert_created', 'created_at'),
+        Index('idx_alert_read', 'is_read'),
+        {'schema': 'public'}
+    )
+    
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id = Column(UUID(as_uuid=True), ForeignKey('users.id'), nullable=False)
+    
+    alert_type = Column(String(50), nullable=False)
+    severity = Column(String(20), nullable=False)
+    title = Column(String(255), nullable=False)
+    message = Column(Text, nullable=False)
+    
+    location = Column(JSONB)
+    weather_data = Column(JSONB)
+    metadata = Column(JSONB)
+    
+    is_read = Column(Boolean, default=False, nullable=False)
+    is_pushed = Column(Boolean, default=False)
+    
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    read_at = Column(DateTime(timezone=True))
+    expires_at = Column(DateTime(timezone=True))
+    
+    user = relationship('User', back_populates='alerts')
 
 class WeatherLog(db.Model):
     __tablename__ = 'weather_logs'
+    __table_args__ = (
+        Index('idx_log_user', 'user_id'),
+        Index('idx_log_created', 'created_at'),
+        Index('idx_log_location', 'location_hash'),
+        {'schema': 'public'}
+    )
     
-    id = db.Column(db.Integer, primary_key=True)
-    user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False)
-    location = db.Column(db.String(100))
-    weather_data = db.Column(JSON)
-    mood = db.Column(db.String(50))
-    note = db.Column(db.Text)
-    photo_url = db.Column(db.String(500))
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id = Column(UUID(as_uuid=True), ForeignKey('users.id'), nullable=False)
+    
+    location = Column(JSONB, nullable=False)
+    location_hash = Column(String(64))
+    weather_data = Column(JSONB, nullable=False)
+    
+    mood = Column(String(50))
+    note = Column(Text)
+    tags = Column(ARRAY(String))
+    
+    photos = Column(ARRAY(String))
+    
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    
+    user = relationship('User', back_populates='logs')
+    
+    def set_location(self, location_data):
+        self.location = location_data
+        self.location_hash = hashlib.sha256(json.dumps(location_data, sort_keys=True).encode()).hexdigest()
 
-# ======================= HELPER FUNCTIONS =======================
+class CustomTrigger(db.Model):
+    __tablename__ = 'custom_triggers'
+    __table_args__ = (
+        Index('idx_trigger_user', 'user_id'),
+        Index('idx_trigger_active', 'is_active'),
+        UniqueConstraint('user_id', 'name', name='unique_user_trigger_name'),
+        {'schema': 'public'}
+    )
+    
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id = Column(UUID(as_uuid=True), ForeignKey('users.id'), nullable=False)
+    
+    name = Column(String(100), nullable=False)
+    description = Column(Text)
+    
+    condition_type = Column(String(50), nullable=False)
+    condition_value = Column(Float)
+    condition_operator = Column(String(10))
+    
+    location = Column(JSONB)
+    schedule = Column(JSONB)
+    
+    is_active = Column(Boolean, default=True, nullable=False)
+    is_recurring = Column(Boolean, default=True)
+    
+    last_triggered = Column(DateTime(timezone=True))
+    trigger_count = Column(Integer, default=0)
+    
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    updated_at = Column(DateTime(timezone=True), onupdate=lambda: datetime.now(timezone.utc))
+    
+    user = relationship('User', back_populates='triggers')
 
-def rate_limit(max_requests=60, window=60):
-    """Rate limiting decorator"""
-    def decorator(f):
-        @wraps(f)
-        def wrapped(*args, **kwargs):
-            identifier = request.remote_addr
-            now = time.time()
-            
-            # Clean old entries
-            rate_limit_storage[identifier] = [
-                timestamp for timestamp in rate_limit_storage[identifier]
-                if now - timestamp < window
-            ]
-            
-            if len(rate_limit_storage[identifier]) >= max_requests:
-                return jsonify({'error': 'Rate limit exceeded'}), 429
-            
-            rate_limit_storage[identifier].append(now)
-            return f(*args, **kwargs)
-        return wrapped
-    return decorator
+class WeatherCache(db.Model):
+    __tablename__ = 'weather_cache'
+    __table_args__ = (
+        Index('idx_cache_location', 'location_hash'),
+        Index('idx_cache_expires', 'expires_at'),
+        {'schema': 'public'}
+    )
+    
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    location_hash = Column(String(64), unique=True, nullable=False)
+    location = Column(JSONB, nullable=False)
+    weather_data = Column(JSONB, nullable=False)
+    
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    expires_at = Column(DateTime(timezone=True))
 
-def token_required(f):
-    """JWT token authentication decorator"""
+class AuditLog(db.Model):
+    __tablename__ = 'audit_logs'
+    __table_args__ = (
+        Index('idx_audit_user', 'user_id'),
+        Index('idx_audit_created', 'created_at'),
+        Index('idx_audit_action', 'action'),
+        {'schema': 'public'}
+    )
+    
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id = Column(UUID(as_uuid=True))
+    
+    action = Column(String(100), nullable=False)
+    resource_type = Column(String(50))
+    resource_id = Column(String(255))
+    
+    ip_address = Column(String(45))
+    user_agent = Column(String(500))
+    
+    request_data = Column(JSONB)
+    response_data = Column(JSONB)
+    
+    status_code = Column(Integer)
+    duration_ms = Column(Integer)
+    
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+
+class UserSchema(Schema):
+    id = fields.UUID(dump_only=True)
+    email = fields.Email(required=True, validate=validate.Length(max=255))
+    username = fields.Str(required=True, validate=validate.Length(min=3, max=80))
+    password = fields.Str(required=True, load_only=True, validate=validate.Length(min=8))
+    is_active = fields.Bool(dump_only=True)
+    is_verified = fields.Bool(dump_only=True)
+    is_premium = fields.Bool(dump_only=True)
+    created_at = fields.DateTime(dump_only=True)
+    last_active = fields.DateTime(dump_only=True)
+    streak_count = fields.Int(dump_only=True)
+    preferences = fields.Dict()
+    
+    @pre_load
+    def process_input(self, data, **kwargs):
+        if 'email' in data:
+            data['email'] = data['email'].lower().strip()
+        if 'username' in data:
+            data['username'] = data['username'].strip()
+        return data
+
+class LocationSchema(Schema):
+    latitude = fields.Float(required=True, validate=validate.Range(min=-90, max=90))
+    longitude = fields.Float(required=True, validate=validate.Range(min=-180, max=180))
+    city = fields.Str(validate=validate.Length(max=100))
+    country = fields.Str(validate=validate.Length(max=100))
+
+class WeatherRequestSchema(Schema):
+    lat = fields.Float(validate=validate.Range(min=-90, max=90))
+    lon = fields.Float(validate=validate.Range(min=-180, max=180))
+    city = fields.Str(validate=validate.Length(max=100))
+    units = fields.Str(validate=validate.OneOf(['metric', 'imperial']), missing='metric')
+    lang = fields.Str(validate=validate.Length(max=5), missing='en')
+
+class TriggerSchema(Schema):
+    name = fields.Str(required=True, validate=validate.Length(min=1, max=100))
+    description = fields.Str(validate=validate.Length(max=500))
+    condition_type = fields.Str(required=True, validate=validate.OneOf([e.value for e in TriggerCondition]))
+    condition_value = fields.Float()
+    location = fields.Nested(LocationSchema)
+    is_active = fields.Bool(missing=True)
+
+class CustomException(Exception):
+    def __init__(self, message, status_code=400, payload=None):
+        super().__init__()
+        self.message = message
+        self.status_code = status_code
+        self.payload = payload
+
+class AuthenticationError(CustomException):
+    def __init__(self, message='Authentication failed'):
+        super().__init__(message, 401)
+
+class AuthorizationError(CustomException):
+    def __init__(self, message='Insufficient permissions'):
+        super().__init__(message, 403)
+
+class ValidationError(CustomException):
+    def __init__(self, message='Validation failed', errors=None):
+        super().__init__(message, 422, errors)
+
+class ResourceNotFoundError(CustomException):
+    def __init__(self, message='Resource not found'):
+        super().__init__(message, 404)
+
+class RateLimitError(CustomException):
+    def __init__(self, message='Rate limit exceeded'):
+        super().__init__(message, 429)
+
+class ExternalAPIError(CustomException):
+    def __init__(self, message='External API error'):
+        super().__init__(message, 502)
+
+@app.errorhandler(CustomException)
+def handle_custom_exception(error):
+    response = {'error': error.message}
+    if error.payload:
+        response['details'] = error.payload
+    return jsonify(response), error.status_code
+
+@app.errorhandler(ValidationError)
+def handle_validation_error(error):
+    return jsonify({'error': 'Validation failed', 'details': error.messages}), 422
+
+@app.errorhandler(404)
+def handle_not_found(error):
+    return jsonify({'error': 'Resource not found'}), 404
+
+@app.errorhandler(500)
+def handle_internal_error(error):
+    logger.error(f'Internal server error: {str(error)}', exc_info=True)
+    return jsonify({'error': 'Internal server error', 'request_id': g.get('request_id')}), 500
+
+@app.before_request
+def before_request():
+    g.request_id = request.headers.get('X-Request-ID', str(uuid.uuid4()))
+    g.start_time = time.time()
+    g.user = None
+    
+    if request.method != 'OPTIONS':
+        logger.info(f'Request: {request.method} {request.path} - ID: {g.request_id}')
+
+@app.after_request
+def after_request(response):
+    if hasattr(g, 'start_time'):
+        duration = round((time.time() - g.start_time) * 1000, 2)
+        response.headers['X-Response-Time'] = f'{duration}ms'
+    
+    response.headers['X-Request-ID'] = g.get('request_id', '')
+    response.headers['X-Content-Type-Options'] = 'nosniff'
+    response.headers['X-Frame-Options'] = 'DENY'
+    response.headers['X-XSS-Protection'] = '1; mode=block'
+    response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
+    response.headers['Content-Security-Policy'] = "default-src 'self'"
+    
+    if request.method != 'OPTIONS':
+        logger.info(f'Response: {response.status_code} - ID: {g.request_id} - Time: {duration}ms')
+    
+    return response
+
+def require_auth(f):
     @wraps(f)
-    def decorated(*args, **kwargs):
-        token = request.headers.get('Authorization')
+    def decorated_function(*args, **kwargs):
+        auth_header = request.headers.get('Authorization')
         
-        if not token:
-            return jsonify({'error': 'Token missing'}), 401
+        if not auth_header:
+            raise AuthenticationError('Missing authorization header')
         
         try:
-            if token.startswith('Bearer '):
-                token = token[7:]
-            data = jwt.decode(token, app.config['SECRET_KEY'], algorithms=['HS256'])
-            g.current_user = User.query.get(data['user_id'])
-            if not g.current_user:
-                return jsonify({'error': 'Invalid token'}), 401
+            scheme, token = auth_header.split(' ', 1)
+            if scheme.lower() != 'bearer':
+                raise AuthenticationError('Invalid authentication scheme')
+            
+            payload = jwt.decode(token, app.config['SECRET_KEY'], algorithms=['HS256'])
+            
+            session = UserSession.query.filter_by(
+                token=token,
+                is_active=True
+            ).first()
+            
+            if not session or session.expires_at < datetime.now(timezone.utc):
+                raise AuthenticationError('Invalid or expired token')
+            
+            g.user = User.query.get(payload['user_id'])
+            if not g.user or not g.user.is_active:
+                raise AuthenticationError('User account is inactive')
+            
+            session.last_used = datetime.now(timezone.utc)
+            db.session.commit()
+            
         except jwt.ExpiredSignatureError:
-            return jsonify({'error': 'Token expired'}), 401
+            raise AuthenticationError('Token has expired')
         except jwt.InvalidTokenError:
-            return jsonify({'error': 'Invalid token'}), 401
+            raise AuthenticationError('Invalid token')
+        except Exception as e:
+            logger.error(f'Authentication error: {str(e)}')
+            raise AuthenticationError()
         
         return f(*args, **kwargs)
-    
-    return decorated
+    return decorated_function
 
-def get_user_location():
-    """Get user location from IP address"""
-    try:
-        ip = request.headers.get('X-Forwarded-For', request.remote_addr)
-        if ',' in ip:
-            ip = ip.split(',')[0].strip()
-        
-        # Use ipinfo.io for location detection
-        response = requests.get(f'https://ipinfo.io/{ip}/json?token={IPINFO_TOKEN}', timeout=5)
-        if response.status_code == 200:
-            data = response.json()
-            if 'loc' in data:
-                lat, lon = data['loc'].split(',')
-                return {
-                    'lat': float(lat),
-                    'lon': float(lon),
-                    'city': data.get('city', 'Unknown'),
-                    'country': data.get('country', 'Unknown')
-                }
-    except Exception as e:
-        logger.error(f"Location detection error: {e}")
-    
-    # Default to New York if detection fails
-    return {'lat': 40.7128, 'lon': -74.0060, 'city': 'New York', 'country': 'US'}
+def require_premium(f):
+    @wraps(f)
+    @require_auth
+    def decorated_function(*args, **kwargs):
+        if not g.user.is_premium:
+            raise AuthorizationError('Premium subscription required')
+        return f(*args, **kwargs)
+    return decorated_function
 
+def validate_request(schema_class):
+    def decorator(f):
+        @wraps(f)
+        def decorated_function(*args, **kwargs):
+            schema = schema_class()
+            try:
+                if request.method in ['POST', 'PUT', 'PATCH']:
+                    data = schema.load(request.json or {})
+                else:
+                    data = schema.load(request.args.to_dict())
+                g.validated_data = data
+            except ValidationError as e:
+                raise ValidationError('Invalid request data', errors=e.messages)
+            return f(*args, **kwargs)
+        return decorated_function
+    return decorator
+
+def audit_log(action, resource_type=None):
+    def decorator(f):
+        @wraps(f)
+        def decorated_function(*args, **kwargs):
+            start_time = time.time()
+            response = None
+            status_code = 200
+            
+            try:
+                response = f(*args, **kwargs)
+                if isinstance(response, tuple):
+                    status_code = response[1]
+                return response
+            finally:
+                duration_ms = int((time.time() - start_time) * 1000)
+                
+                log_entry = AuditLog(
+                    user_id=g.user.id if g.user else None,
+                    action=action,
+                    resource_type=resource_type,
+                    resource_id=kwargs.get('id'),
+                    ip_address=request.remote_addr,
+                    user_agent=request.headers.get('User-Agent'),
+                    request_data=request.json if request.method in ['POST', 'PUT', 'PATCH'] else None,
+                    status_code=status_code,
+                    duration_ms=duration_ms
+                )
+                db.session.add(log_entry)
+                db.session.commit()
+                
+        return decorated_function
+    return decorator
+
+@cache.memoize(timeout=300)
 def get_spotify_token():
-    """Get Spotify access token using Client Credentials Flow"""
+    cache_key = 'spotify:token'
+    cached_token = redis_client.get(cache_key)
+    
+    if cached_token:
+        return cached_token
+    
     try:
-        auth_str = f"{SPOTIFY_CLIENT_ID}:{SPOTIFY_CLIENT_SECRET}"
-        auth_bytes = auth_str.encode('utf-8')
-        auth_base64 = base64.b64encode(auth_bytes).decode('utf-8')
+        auth_str = f"{app.config['SPOTIFY_CLIENT_ID']}:{app.config['SPOTIFY_CLIENT_SECRET']}"
+        auth_bytes = auth_str.encode('ascii')
+        auth_base64 = base64.b64encode(auth_bytes).decode('ascii')
         
         headers = {
             'Authorization': f'Basic {auth_base64}',
             'Content-Type': 'application/x-www-form-urlencoded'
         }
         
-        data = {'grant_type': 'client_credentials'}
-        
-        response = requests.post('https://accounts.spotify.com/api/token', 
-                                headers=headers, data=data, timeout=10)
+        response = requests.post(
+            'https://accounts.spotify.com/api/token',
+            headers=headers,
+            data={'grant_type': 'client_credentials'},
+            timeout=10
+        )
         
         if response.status_code == 200:
-            return response.json().get('access_token')
+            token_data = response.json()
+            token = token_data['access_token']
+            expires_in = token_data.get('expires_in', 3600)
+            
+            redis_client.setex(cache_key, expires_in - 60, token)
+            return token
+            
     except Exception as e:
-        logger.error(f"Spotify token error: {e}")
+        logger.error(f'Spotify token error: {str(e)}')
+        
     return None
 
-def get_weather_playlist(weather_condition):
-    """Map weather conditions to Spotify playlists"""
-    playlists = {
-        'Clear': {'name': 'Sunny Vibes', 'query': 'happy summer hits'},
-        'Clouds': {'name': 'Cloudy Day Chill', 'query': 'chill ambient cloudy'},
-        'Rain': {'name': 'Rainy Day Lo-Fi', 'query': 'lofi rain study'},
-        'Drizzle': {'name': 'Soft Rain Sounds', 'query': 'soft rain acoustic'},
-        'Thunderstorm': {'name': 'Storm Energy', 'query': 'epic storm electronic'},
-        'Snow': {'name': 'Winter Wonderland', 'query': 'cozy winter fireplace'},
-        'Mist': {'name': 'Misty Morning', 'query': 'morning meditation ambient'},
-        'Fog': {'name': 'Foggy Mystery', 'query': 'mysterious ambient fog'}
+@cache.memoize(timeout=600)
+def get_user_location_from_ip(ip_address):
+    cache_key = f'location:ip:{ip_address}'
+    cached_location = redis_client.get(cache_key)
+    
+    if cached_location:
+        return json.loads(cached_location)
+    
+    try:
+        if ip_address in ['127.0.0.1', 'localhost']:
+            location = {
+                'latitude': 40.7128,
+                'longitude': -74.0060,
+                'city': 'New York',
+                'country': 'United States'
+            }
+        else:
+            response = requests.get(
+                f'http://ip-api.com/json/{ip_address}',
+                timeout=5
+            )
+            if response.status_code == 200:
+                data = response.json()
+                if data['status'] == 'success':
+                    location = {
+                        'latitude': data['lat'],
+                        'longitude': data['lon'],
+                        'city': data['city'],
+                        'country': data['country'],
+                        'region': data.get('regionName'),
+                        'timezone': data.get('timezone')
+                    }
+                else:
+                    raise Exception('IP geolocation failed')
+            else:
+                raise Exception('IP API request failed')
+        
+        redis_client.setex(cache_key, 3600, json.dumps(location))
+        return location
+        
+    except Exception as e:
+        logger.error(f'IP geolocation error: {str(e)}')
+        return {
+            'latitude': 40.7128,
+            'longitude': -74.0060,
+            'city': 'New York',
+            'country': 'United States'
+        }
+
+def fetch_weather_data(lat, lon, units='metric', lang='en'):
+    cache_key = f'weather:{lat}:{lon}:{units}:{lang}'
+    cached_data = redis_client.get(cache_key)
+    
+    if cached_data:
+        return json.loads(cached_data)
+    
+    def _make_request():
+        url = f"https://api.openweathermap.org/data/2.5/weather"
+        params = {
+            'lat': lat,
+            'lon': lon,
+            'appid': app.config['OPENWEATHER_API_KEY'],
+            'units': units,
+            'lang': lang
+        }
+        
+        response = requests.get(url, params=params, timeout=10)
+        response.raise_for_status()
+        return response.json()
+    
+    try:
+        data = weather_api_breaker.call(_make_request)
+        redis_client.setex(cache_key, 300, json.dumps(data))
+        return data
+    except Exception as e:
+        logger.error(f'Weather API error: {str(e)}')
+        raise ExternalAPIError('Weather service temporarily unavailable')
+
+def fetch_forecast_data(lat, lon, units='metric', lang='en'):
+    cache_key = f'forecast:{lat}:{lon}:{units}:{lang}'
+    cached_data = redis_client.get(cache_key)
+    
+    if cached_data:
+        return json.loads(cached_data)
+    
+    def _make_request():
+        url = f"https://api.openweathermap.org/data/2.5/onecall"
+        params = {
+            'lat': lat,
+            'lon': lon,
+            'exclude': 'minutely',
+            'appid': app.config['OPENWEATHER_API_KEY'],
+            'units': units,
+            'lang': lang
+        }
+        
+        response = requests.get(url, params=params, timeout=10)
+        response.raise_for_status()
+        return response.json()
+    
+    try:
+        data = weather_api_breaker.call(_make_request)
+        redis_client.setex(cache_key, 900, json.dumps(data))
+        return data
+    except Exception as e:
+        logger.error(f'Forecast API error: {str(e)}')
+        raise ExternalAPIError('Forecast service temporarily unavailable')
+
+def get_weather_playlist(condition):
+    playlist_map = {
+        WeatherCondition.CLEAR: {'name': 'Sunny Vibes', 'query': 'sunny day playlist'},
+        WeatherCondition.CLOUDS: {'name': 'Cloudy Chill', 'query': 'cloudy day music'},
+        WeatherCondition.RAIN: {'name': 'Rainy Mood', 'query': 'rain sounds lofi'},
+        WeatherCondition.THUNDERSTORM: {'name': 'Storm Energy', 'query': 'thunderstorm epic'},
+        WeatherCondition.SNOW: {'name': 'Winter Wonder', 'query': 'cozy winter playlist'},
+        WeatherCondition.MIST: {'name': 'Misty Morning', 'query': 'ambient fog music'}
     }
     
-    return playlists.get(weather_condition, {'name': 'Weather Mix', 'query': 'weather nature sounds'})
+    playlist_info = playlist_map.get(
+        WeatherCondition(condition.lower()) if condition.lower() in [e.value for e in WeatherCondition] else WeatherCondition.CLEAR,
+        playlist_map[WeatherCondition.CLEAR]
+    )
+    
+    token = get_spotify_token()
+    if not token:
+        return playlist_info
+    
+    try:
+        def _make_request():
+            headers = {'Authorization': f'Bearer {token}'}
+            response = requests.get(
+                'https://api.spotify.com/v1/search',
+                headers=headers,
+                params={'q': playlist_info['query'], 'type': 'playlist', 'limit': 1},
+                timeout=10
+            )
+            response.raise_for_status()
+            return response.json()
+        
+        data = spotify_api_breaker.call(_make_request)
+        
+        if data['playlists']['items']:
+            playlist = data['playlists']['items'][0]
+            playlist_info.update({
+                'spotify_url': playlist['external_urls']['spotify'],
+                'id': playlist['id'],
+                'image': playlist['images'][0]['url'] if playlist['images'] else None
+            })
+            
+    except Exception as e:
+        logger.error(f'Spotify API error: {str(e)}')
+    
+    return playlist_info
 
-def get_weather_sounds(weather_condition):
-    """Map weather conditions to background sound URLs"""
-    sounds = {
-        'Clear': 'https://cdn.pixabay.com/audio/2022/03/10/audio_c8c8a73467.mp3',  # Birds chirping
-        'Clouds': 'https://cdn.pixabay.com/audio/2021/08/04/audio_12b0c7443c.mp3',  # Wind
-        'Rain': 'https://cdn.pixabay.com/audio/2022/05/13/audio_257112ce99.mp3',  # Rain
-        'Drizzle': 'https://cdn.pixabay.com/audio/2022/05/13/audio_257112ce99.mp3',  # Light rain
-        'Thunderstorm': 'https://cdn.pixabay.com/audio/2021/08/04/audio_bb84e53e0e.mp3',  # Thunder
-        'Snow': 'https://cdn.pixabay.com/audio/2022/11/21/audio_18e2de1e46.mp3',  # Fireplace
-        'Mist': 'https://cdn.pixabay.com/audio/2024/02/09/audio_8568d5e164.mp3',  # Ocean waves
-        'Fog': 'https://cdn.pixabay.com/audio/2024/02/09/audio_8568d5e164.mp3'  # Ambient
+def get_weather_sounds(condition):
+    sound_map = {
+        WeatherCondition.CLEAR: {
+            'name': 'Birds Chirping',
+            'url': 'https://cdn.example.com/sounds/birds.mp3',
+            'description': 'Nature sounds for sunny days'
+        },
+        WeatherCondition.RAIN: {
+            'name': 'Rain Ambience',
+            'url': 'https://cdn.example.com/sounds/rain.mp3',
+            'description': 'Gentle rain for relaxation'
+        },
+        WeatherCondition.THUNDERSTORM: {
+            'name': 'Thunder Storm',
+            'url': 'https://cdn.example.com/sounds/thunder.mp3',
+            'description': 'Dramatic storm sounds'
+        },
+        WeatherCondition.SNOW: {
+            'name': 'Winter Fireplace',
+            'url': 'https://cdn.example.com/sounds/fireplace.mp3',
+            'description': 'Cozy fireplace crackling'
+        },
+        WeatherCondition.MIST: {
+            'name': 'Ocean Waves',
+            'url': 'https://cdn.example.com/sounds/ocean.mp3',
+            'description': 'Calming ocean ambience'
+        }
     }
     
-    return sounds.get(weather_condition, sounds['Clear'])
+    return sound_map.get(
+        WeatherCondition(condition.lower()) if condition.lower() in [e.value for e in WeatherCondition] else WeatherCondition.CLEAR,
+        sound_map[WeatherCondition.CLEAR]
+    )
 
-def get_weather_activities(weather, temp):
-    """Suggest activities based on weather conditions"""
-    activities = []
+@lru_cache(maxsize=100)
+def get_activity_suggestions(temp, condition, wind_speed):
+    suggestions = []
     
-    if weather == 'Clear' and temp > 20:
-        activities = [
-            "Perfect day for a picnic in the park! 🧺",
-            "Great weather for outdoor photography 📸",
-            "Ideal conditions for a bike ride 🚴",
-            "Time for a refreshing walk in nature 🚶",
-            "Perfect for outdoor sports ⚽"
-        ]
-    elif weather == 'Clear' and temp <= 20:
-        activities = [
-            "Cool and clear - perfect for a morning jog 🏃",
-            "Great day for hiking with a light jacket 🥾",
-            "Enjoy a warm coffee at an outdoor café ☕",
-            "Visit a local farmer's market 🛒"
-        ]
-    elif weather in ['Rain', 'Drizzle']:
-        activities = [
-            "Cozy up with a good book and hot chocolate 📚☕",
-            "Perfect movie marathon weather 🎬",
-            "Time for indoor yoga or meditation 🧘",
-            "Great day for cooking a new recipe 👨‍🍳",
-            "Visit a museum or art gallery 🎨"
-        ]
-    elif weather == 'Snow':
-        activities = [
-            "Build a snowman! ⛄",
-            "Perfect for skiing or snowboarding 🎿",
-            "Enjoy hot soup by the fireplace 🍲",
-            "Time for winter photography ❄️📸",
-            "Have a snowball fight! ❄️"
-        ]
-    elif weather == 'Clouds':
-        activities = [
-            "Great light for photography 📷",
-            "Comfortable weather for a long walk 🚶",
-            "Perfect for outdoor reading 📖",
-            "Visit a local café ☕",
-            "Good day for gardening 🌱"
-        ]
-    else:
-        activities = [
-            "Check out a new podcast 🎧",
-            "Organize your living space 🏠",
-            "Call a friend you haven't talked to in a while 📞",
-            "Start a new hobby 🎨",
-            "Plan your next adventure 🗺️"
-        ]
+    if condition in ['clear', 'clouds'] and 15 <= temp <= 28:
+        suggestions.extend([
+            {'icon': '🚴', 'activity': 'Cycling', 'description': 'Perfect weather for a bike ride'},
+            {'icon': '🏃', 'activity': 'Running', 'description': 'Great conditions for outdoor exercise'},
+            {'icon': '🧺', 'activity': 'Picnic', 'description': 'Ideal day for outdoor dining'},
+            {'icon': '📸', 'activity': 'Photography', 'description': 'Excellent lighting conditions'}
+        ])
+    elif 'rain' in condition.lower():
+        suggestions.extend([
+            {'icon': '📚', 'activity': 'Reading', 'description': 'Cozy up with a good book'},
+            {'icon': '☕', 'activity': 'Café Visit', 'description': 'Perfect for indoor socializing'},
+            {'icon': '🎬', 'activity': 'Movie Marathon', 'description': 'Great day for entertainment'},
+            {'icon': '🎨', 'activity': 'Creative Projects', 'description': 'Time for indoor hobbies'}
+        ])
+    elif temp > 30:
+        suggestions.extend([
+            {'icon': '🏊', 'activity': 'Swimming', 'description': 'Cool off in the water'},
+            {'icon': '🍦', 'activity': 'Ice Cream', 'description': 'Treat yourself to something cold'},
+            {'icon': '🏖️', 'activity': 'Beach Day', 'description': 'Head to the coast'},
+            {'icon': '🌊', 'activity': 'Water Sports', 'description': 'Try surfing or paddleboarding'}
+        ])
+    elif temp < 10:
+        suggestions.extend([
+            {'icon': '🧣', 'activity': 'Winter Walk', 'description': 'Bundle up for fresh air'},
+            {'icon': '🍲', 'activity': 'Cooking', 'description': 'Make warm comfort food'},
+            {'icon': '🏋️', 'activity': 'Indoor Gym', 'description': 'Stay active indoors'},
+            {'icon': '🎮', 'activity': 'Gaming', 'description': 'Perfect weather for indoor fun'}
+        ])
     
-    return random.sample(activities, min(3, len(activities)))
+    if wind_speed > 20:
+        suggestions.append({'icon': '🪁', 'activity': 'Kite Flying', 'description': 'Great wind conditions'})
+    
+    return random.sample(suggestions, min(3, len(suggestions)))
 
-def get_weather_fun_fact():
-    """Return a random weather fun fact"""
+def get_weather_fun_facts():
     facts = [
-        "The highest temperature ever recorded was 134°F (56.7°C) in Death Valley, California!",
-        "A single lightning bolt can reach temperatures of 30,000°C - 5 times hotter than the sun's surface!",
-        "The longest recorded heatwave lasted 160 days in Marble Bar, Australia (1923-1924).",
-        "Raindrops aren't actually teardrop-shaped - they're more like hamburger buns!",
-        "The world's largest snowflake was 15 inches wide and 8 inches thick!",
-        "A cloud can weigh more than 1 million pounds!",
-        "Lightning strikes the Earth about 100 times per second.",
-        "The windiest place on Earth is Antarctica, with winds reaching 200 mph!",
-        "It can be too cold to snow! Extremely cold air holds very little moisture.",
-        "The smell of rain has a name - 'Petrichor'!",
-        "Hurricanes in the Southern Hemisphere spin clockwise, opposite to Northern ones.",
-        "The coldest temperature ever recorded was -128.6°F (-89.2°C) in Antarctica.",
-        "A rainbow can only be seen in the morning or late afternoon.",
-        "Ball lightning is a rare phenomenon that scientists still can't fully explain!",
-        "The fastest wind speed ever recorded was 318 mph during a tornado in Oklahoma.",
-        "Weather forecasting dates back to 650 BC in Babylon!",
-        "Mammatus clouds look like bubble wrap in the sky!",
-        "A 'moonbow' is a rainbow that occurs at night!",
-        "Snowflakes can take up to 1 hour to fall from cloud to ground.",
-        "The weather on Mount Washington changes every 15 minutes on average!"
+        {'emoji': '🌡️', 'fact': 'The highest temperature ever recorded was 134°F (56.7°C) in Death Valley!'},
+        {'emoji': '❄️', 'fact': 'Antarctica recorded the coldest temperature: -128.6°F (-89.2°C)!'},
+        {'emoji': '⚡', 'fact': 'Lightning strikes Earth 100 times per second globally!'},
+        {'emoji': '🌪️', 'fact': 'The fastest tornado wind speed recorded was 301 mph!'},
+        {'emoji': '🌧️', 'fact': 'One inch of rain equals approximately 10 inches of snow!'},
+        {'emoji': '🌈', 'fact': 'Rainbows are actually full circles, but we only see half from the ground!'},
+        {'emoji': '☁️', 'fact': 'A cumulus cloud can weigh as much as 100 elephants!'},
+        {'emoji': '🦗', 'fact': 'Count cricket chirps for 14 seconds and add 40 to estimate temperature in °F!'},
+        {'emoji': '❄️', 'fact': 'Every snowflake has exactly 6 sides due to water molecule structure!'},
+        {'emoji': '🌊', 'fact': 'Tsunamis can travel at speeds up to 500 mph in deep ocean!'}
     ]
-    
     return random.choice(facts)
 
-def get_personalized_greeting(user, weather, temp):
-    """Generate personalized greeting based on time and weather"""
-    hour = datetime.now().hour
-    name = user.username if user else "Friend"
+def check_and_trigger_alerts(user, weather_data):
+    triggers = CustomTrigger.query.filter_by(
+        user_id=user.id,
+        is_active=True
+    ).all()
     
-    if 5 <= hour < 12:
-        time_greeting = "Good morning"
-    elif 12 <= hour < 17:
-        time_greeting = "Good afternoon"
-    elif 17 <= hour < 21:
-        time_greeting = "Good evening"
-    else:
-        time_greeting = "Good night"
-    
-    weather_comment = ""
-    if weather == "Clear" and temp > 25:
-        weather_comment = "It's a beautiful sunny day!"
-    elif weather == "Rain":
-        weather_comment = "Don't forget your umbrella!"
-    elif weather == "Snow":
-        weather_comment = "Bundle up, it's snowy!"
-    elif temp < 10:
-        weather_comment = "It's quite chilly today!"
-    elif temp > 30:
-        weather_comment = "Stay hydrated in this heat!"
-    
-    return f"{time_greeting}, {name}! {weather_comment}"
-
-def send_push_notification(user_id, title, message):
-    """Send push notification via Firebase or OneSignal"""
-    try:
-        if FIREBASE_SERVER_KEY:
-            # Firebase implementation
-            headers = {
-                'Authorization': f'key={FIREBASE_SERVER_KEY}',
-                'Content-Type': 'application/json'
-            }
-            
-            data = {
-                'to': f'/topics/user_{user_id}',
-                'notification': {
-                    'title': title,
-                    'body': message,
-                    'icon': 'weather-icon'
-                }
-            }
-            
-            requests.post('https://fcm.googleapis.com/fcm/send', 
-                         json=data, headers=headers, timeout=5)
-        
-        elif ONESIGNAL_APP_ID and ONESIGNAL_API_KEY:
-            # OneSignal implementation
-            headers = {
-                'Authorization': f'Basic {ONESIGNAL_API_KEY}',
-                'Content-Type': 'application/json'
-            }
-            
-            data = {
-                'app_id': ONESIGNAL_APP_ID,
-                'include_external_user_ids': [str(user_id)],
-                'contents': {'en': message},
-                'headings': {'en': title}
-            }
-            
-            requests.post('https://onesignal.com/api/v1/notifications',
-                         json=data, headers=headers, timeout=5)
-    except Exception as e:
-        logger.error(f"Push notification error: {e}")
-
-def check_alert_triggers(user, weather_data):
-    """Check if any user alerts should be triggered"""
-    if not user or not user.preferences.get('notifications_enabled'):
-        return
-    
-    alerts = Alert.query.filter_by(user_id=user.id, enabled=True).all()
-    
-    for alert in alerts:
+    for trigger in triggers:
         should_trigger = False
-        message = ""
+        current_value = None
         
-        if alert.type == 'temp_drop' and 'temp' in alert.condition:
-            threshold = alert.condition['temp']
-            current_temp = weather_data.get('main', {}).get('temp', 999)
-            if current_temp < threshold:
+        if trigger.condition_type == TriggerCondition.TEMP_BELOW.value:
+            current_value = weather_data.get('main', {}).get('temp')
+            if current_value and current_value < trigger.condition_value:
                 should_trigger = True
-                message = f"Temperature dropped below {threshold}°C in {alert.location}"
-        
-        elif alert.type == 'rain_start':
-            if weather_data.get('weather', [{}])[0].get('main') in ['Rain', 'Drizzle']:
+                
+        elif trigger.condition_type == TriggerCondition.TEMP_ABOVE.value:
+            current_value = weather_data.get('main', {}).get('temp')
+            if current_value and current_value > trigger.condition_value:
                 should_trigger = True
-                message = f"It's starting to rain in {alert.location}"
-        
-        elif alert.type == 'wind_alert' and 'wind' in alert.condition:
-            threshold = alert.condition['wind']
-            current_wind = weather_data.get('wind', {}).get('speed', 0)
-            if current_wind > threshold:
+                
+        elif trigger.condition_type == TriggerCondition.WIND_ABOVE.value:
+            current_value = weather_data.get('wind', {}).get('speed')
+            if current_value and current_value > trigger.condition_value:
                 should_trigger = True
-                message = f"Strong winds ({current_wind} km/h) in {alert.location}"
+                
+        elif trigger.condition_type == TriggerCondition.RAIN_STARTS.value:
+            weather_condition = weather_data.get('weather', [{}])[0].get('main', '').lower()
+            if 'rain' in weather_condition:
+                should_trigger = True
+                current_value = 'Raining'
         
         if should_trigger:
-            # Check if not recently triggered (within last hour)
-            if alert.last_triggered:
-                time_diff = datetime.utcnow() - alert.last_triggered
+            if trigger.last_triggered:
+                time_diff = datetime.now(timezone.utc) - trigger.last_triggered
                 if time_diff.total_seconds() < 3600:
                     continue
             
-            alert.last_triggered = datetime.utcnow()
-            db.session.commit()
+            alert = WeatherAlert(
+                user_id=user.id,
+                alert_type='custom_trigger',
+                severity=AlertSeverity.MEDIUM.value,
+                title=f'Weather Alert: {trigger.name}',
+                message=f'{trigger.description or trigger.name} triggered. Current value: {current_value}',
+                location=trigger.location,
+                weather_data=weather_data,
+                metadata={'trigger_id': str(trigger.id), 'value': current_value}
+            )
             
-            send_push_notification(user.id, "Weather Alert", message)
+            db.session.add(alert)
+            trigger.last_triggered = datetime.now(timezone.utc)
+            trigger.trigger_count += 1
+            
+    db.session.commit()
 
-def convert_units(data, units):
-    """Convert weather data to specified units"""
-    if units.get('temp') == 'fahrenheit':
-        if 'temp' in data:
-            data['temp'] = data['temp'] * 9/5 + 32
-        if 'feels_like' in data:
-            data['feels_like'] = data['feels_like'] * 9/5 + 32
+def send_push_notification(user, title, body, data=None):
+    if not user.notification_token or not app.config['FIREBASE_SERVER_KEY']:
+        return False
     
-    if units.get('speed') == 'mph':
-        if 'speed' in data:
-            data['speed'] = data['speed'] * 0.621371
-    
-    return data
-
-# ======================= API ENDPOINTS =======================
+    try:
+        headers = {
+            'Authorization': f'key={app.config["FIREBASE_SERVER_KEY"]}',
+            'Content-Type': 'application/json'
+        }
+        
+        payload = {
+            'to': user.notification_token,
+            'notification': {
+                'title': title,
+                'body': body,
+                'icon': '/icon-192x192.png',
+                'badge': '/badge-72x72.png'
+            },
+            'data': data or {},
+            'priority': 'high'
+        }
+        
+        response = requests.post(
+            'https://fcm.googleapis.com/fcm/send',
+            headers=headers,
+            json=payload,
+            timeout=10
+        )
+        
+        return response.status_code == 200
+        
+    except Exception as e:
+        logger.error(f'Push notification error: {str(e)}')
+        return False
 
 @app.route('/health', methods=['GET'])
 def health_check():
-    """Health check endpoint"""
-    return jsonify({
+    health_status = {
         'status': 'healthy',
-        'timestamp': datetime.utcnow().isoformat(),
-        'version': '1.0.0'
+        'timestamp': datetime.now(timezone.utc).isoformat(),
+        'version': app.config['API_VERSION'],
+        'environment': app.config['ENVIRONMENT']
+    }
+    
+    try:
+        db.session.execute('SELECT 1')
+        health_status['database'] = 'connected'
+    except:
+        health_status['database'] = 'disconnected'
+        health_status['status'] = 'degraded'
+    
+    try:
+        redis_client.ping()
+        health_status['cache'] = 'connected'
+    except:
+        health_status['cache'] = 'disconnected'
+        health_status['status'] = 'degraded'
+    
+    status_code = 200 if health_status['status'] == 'healthy' else 503
+    return jsonify(health_status), status_code
+
+@app.route('/metrics', methods=['GET'])
+def metrics_endpoint():
+    return Response(metrics.generate_latest(), mimetype='text/plain')
+
+@app.route('/api/v1/auth/register', methods=['POST'])
+@limiter.limit("5 per hour")
+@validate_request(UserSchema)
+@audit_log('user.register', 'user')
+def register():
+    data = g.validated_data
+    
+    existing_user = User.query.filter(
+        or_(User.email == data['email'], User.username == data['username'])
+    ).first()
+    
+    if existing_user:
+        if existing_user.email == data['email']:
+            raise ValidationError('Email already registered')
+        else:
+            raise ValidationError('Username already taken')
+    
+    user = User(
+        email=data['email'],
+        username=data['username'],
+        preferences={
+            'units': {'temperature': 'celsius', 'wind': 'km/h'},
+            'theme': 'auto',
+            'language': 'en',
+            'notifications': {'alerts': True, 'daily': True},
+            'favorite_locations': []
+        }
+    )
+    user.set_password(data['password'])
+    user.generate_api_key()
+    
+    db.session.add(user)
+    db.session.commit()
+    
+    token_payload = {
+        'user_id': str(user.id),
+        'email': user.email,
+        'exp': datetime.utcnow() + timedelta(days=app.config['JWT_EXPIRATION_DAYS'])
+    }
+    token = jwt.encode(token_payload, app.config['SECRET_KEY'], algorithm='HS256')
+    
+    refresh_payload = {
+        'user_id': str(user.id),
+        'type': 'refresh',
+        'exp': datetime.utcnow() + timedelta(days=app.config['JWT_REFRESH_EXPIRATION_DAYS'])
+    }
+    refresh_token = jwt.encode(refresh_payload, app.config['SECRET_KEY'], algorithm='HS256')
+    
+    session = UserSession(
+        user_id=user.id,
+        token=token,
+        refresh_token=refresh_token,
+        ip_address=request.remote_addr,
+        user_agent=request.headers.get('User-Agent'),
+        expires_at=datetime.now(timezone.utc) + timedelta(days=app.config['JWT_EXPIRATION_DAYS'])
+    )
+    
+    db.session.add(session)
+    db.session.commit()
+    
+    return jsonify({
+        'user': UserSchema().dump(user),
+        'access_token': token,
+        'refresh_token': refresh_token,
+        'expires_in': app.config['JWT_EXPIRATION_DAYS'] * 86400
+    }), 201
+
+@app.route('/api/v1/auth/login', methods=['POST'])
+@limiter.limit("10 per hour")
+@audit_log('user.login', 'user')
+def login():
+    data = request.json
+    
+    if not data or not data.get('email') or not data.get('password'):
+        raise ValidationError('Email and password required')
+    
+    user = User.query.filter_by(email=data['email'].lower()).first()
+    
+    if not user or not user.check_password(data['password']):
+        raise AuthenticationError('Invalid credentials')
+    
+    if not user.is_active:
+        raise AuthenticationError('Account is disabled')
+    
+    user.update_streak()
+    db.session.commit()
+    
+    token_payload = {
+        'user_id': str(user.id),
+        'email': user.email,
+        'exp': datetime.utcnow() + timedelta(days=app.config['JWT_EXPIRATION_DAYS'])
+    }
+    token = jwt.encode(token_payload, app.config['SECRET_KEY'], algorithm='HS256')
+    
+    refresh_payload = {
+        'user_id': str(user.id),
+        'type': 'refresh',
+        'exp': datetime.utcnow() + timedelta(days=app.config['JWT_REFRESH_EXPIRATION_DAYS'])
+    }
+    refresh_token = jwt.encode(refresh_payload, app.config['SECRET_KEY'], algorithm='HS256')
+    
+    UserSession.query.filter_by(user_id=user.id, is_active=True).update({'is_active': False})
+    
+    session = UserSession(
+        user_id=user.id,
+        token=token,
+        refresh_token=refresh_token,
+        ip_address=request.remote_addr,
+        user_agent=request.headers.get('User-Agent'),
+        device_id=data.get('device_id'),
+        expires_at=datetime.now(timezone.utc) + timedelta(days=app.config['JWT_EXPIRATION_DAYS'])
+    )
+    
+    db.session.add(session)
+    db.session.commit()
+    
+    return jsonify({
+        'user': UserSchema().dump(user),
+        'access_token': token,
+        'refresh_token': refresh_token,
+        'expires_in': app.config['JWT_EXPIRATION_DAYS'] * 86400
     })
 
-@app.route('/api/auth/register', methods=['POST'])
-@rate_limit(max_requests=5, window=300)
-def register():
-    """User registration"""
+@app.route('/api/v1/auth/refresh', methods=['POST'])
+@limiter.limit("20 per hour")
+def refresh_token():
+    data = request.json
+    
+    if not data or not data.get('refresh_token'):
+        raise ValidationError('Refresh token required')
+    
     try:
-        data = request.json
-        email = data.get('email')
-        username = data.get('username')
-        password = data.get('password')
+        payload = jwt.decode(data['refresh_token'], app.config['SECRET_KEY'], algorithms=['HS256'])
         
-        if not all([email, username, password]):
-            return jsonify({'error': 'Missing required fields'}), 400
+        if payload.get('type') != 'refresh':
+            raise AuthenticationError('Invalid token type')
         
-        if User.query.filter_by(email=email).first():
-            return jsonify({'error': 'Email already exists'}), 400
+        user = User.query.get(payload['user_id'])
+        if not user or not user.is_active:
+            raise AuthenticationError('User not found or inactive')
         
-        if User.query.filter_by(username=username).first():
-            return jsonify({'error': 'Username already exists'}), 400
+        session = UserSession.query.filter_by(
+            user_id=user.id,
+            refresh_token=data['refresh_token'],
+            is_active=True
+        ).first()
         
-        user = User(
-            email=email,
-            username=username,
-            password_hash=generate_password_hash(password)
-        )
+        if not session:
+            raise AuthenticationError('Invalid refresh token')
         
-        db.session.add(user)
+        new_token_payload = {
+            'user_id': str(user.id),
+            'email': user.email,
+            'exp': datetime.utcnow() + timedelta(days=app.config['JWT_EXPIRATION_DAYS'])
+        }
+        new_token = jwt.encode(new_token_payload, app.config['SECRET_KEY'], algorithm='HS256')
+        
+        session.token = new_token
+        session.last_used = datetime.now(timezone.utc)
         db.session.commit()
         
-        token = jwt.encode({
-            'user_id': user.id,
-            'exp': datetime.utcnow() + timedelta(days=30)
-        }, app.config['SECRET_KEY'], algorithm='HS256')
-        
         return jsonify({
-            'message': 'Registration successful',
-            'token': token,
-            'user': {
-                'id': user.id,
-                'username': user.username,
-                'email': user.email
-            }
-        }), 201
+            'access_token': new_token,
+            'expires_in': app.config['JWT_EXPIRATION_DAYS'] * 86400
+        })
         
-    except Exception as e:
-        logger.error(f"Registration error: {e}")
-        return jsonify({'error': 'Registration failed'}), 500
+    except jwt.ExpiredSignatureError:
+        raise AuthenticationError('Refresh token has expired')
+    except jwt.InvalidTokenError:
+        raise AuthenticationError('Invalid refresh token')
 
-@app.route('/api/auth/login', methods=['POST'])
-@rate_limit(max_requests=10, window=300)
-def login():
-    """User login"""
-    try:
-        data = request.json
-        email = data.get('email')
-        password = data.get('password')
-        
-        if not all([email, password]):
-            return jsonify({'error': 'Missing credentials'}), 400
-        
-        user = User.query.filter_by(email=email).first()
-        
-        if not user or not check_password_hash(user.password_hash, password):
-            return jsonify({'error': 'Invalid credentials'}), 401
-        
-        user.update_streak()
-        db.session.commit()
-        
-        token = jwt.encode({
-            'user_id': user.id,
-            'exp': datetime.utcnow() + timedelta(days=30)
-        }, app.config['SECRET_KEY'], algorithm='HS256')
-        
-        return jsonify({
-            'message': 'Login successful',
-            'token': token,
-            'user': {
-                'id': user.id,
-                'username': user.username,
-                'email': user.email,
-                'streak': user.streak_count,
-                'preferences': user.preferences
-            }
-        }), 200
-        
-    except Exception as e:
-        logger.error(f"Login error: {e}")
-        return jsonify({'error': 'Login failed'}), 500
+@app.route('/api/v1/auth/logout', methods=['POST'])
+@require_auth
+def logout():
+    auth_header = request.headers.get('Authorization')
+    token = auth_header.split(' ', 1)[1] if ' ' in auth_header else auth_header
+    
+    UserSession.query.filter_by(token=token).update({'is_active': False})
+    db.session.commit()
+    
+    return jsonify({'message': 'Logged out successfully'})
 
-@app.route('/api/weather/current', methods=['GET'])
-@rate_limit(max_requests=60, window=60)
+@app.route('/api/v1/weather/current', methods=['GET'])
+@limiter.limit("100 per hour")
+@validate_request(WeatherRequestSchema)
 def get_current_weather():
-    """Get current weather with automatic location detection"""
+    data = g.validated_data
+    
+    if data.get('lat') and data.get('lon'):
+        lat, lon = data['lat'], data['lon']
+        location_name = f"{lat},{lon}"
+    elif data.get('city'):
+        geocode_url = f"http://api.openweathermap.org/geo/1.0/direct"
+        params = {'q': data['city'], 'limit': 1, 'appid': app.config['OPENWEATHER_API_KEY']}
+        
+        try:
+            response = requests.get(geocode_url, params=params, timeout=5)
+            response.raise_for_status()
+            geo_data = response.json()
+            
+            if not geo_data:
+                raise ResourceNotFoundError('City not found')
+            
+            lat, lon = geo_data[0]['lat'], geo_data[0]['lon']
+            location_name = data['city']
+        except requests.RequestException:
+            raise ExternalAPIError('Geocoding service unavailable')
+    else:
+        location = get_user_location_from_ip(request.remote_addr)
+        lat, lon = location['latitude'], location['longitude']
+        location_name = location['city']
+    
+    weather_data = fetch_weather_data(lat, lon, data['units'], data['lang'])
+    
+    uv_url = f"https://api.openweathermap.org/data/2.5/uvi"
+    uv_params = {'lat': lat, 'lon': lon, 'appid': app.config['OPENWEATHER_API_KEY']}
+    
     try:
-        # Check for manual location parameters
-        lat = request.args.get('lat')
-        lon = request.args.get('lon')
-        city = request.args.get('city')
-        
-        # Get user preferences if authenticated
-        user = None
-        token = request.headers.get('Authorization')
-        if token:
-            try:
-                if token.startswith('Bearer '):
-                    token = token[7:]
-                data = jwt.decode(token, app.config['SECRET_KEY'], algorithms=['HS256'])
-                user = User.query.get(data['user_id'])
-            except:
-                pass
-        
-        # Determine location
-        if lat and lon:
-            url = f"https://api.openweathermap.org/data/2.5/weather?lat={lat}&lon={lon}"
-            location_name = f"{lat},{lon}"
-        elif city:
-            url = f"https://api.openweathermap.org/data/2.5/weather?q={city}"
-            location_name = city
-        else:
-            # Auto-detect location
-            location = get_user_location()
-            url = f"https://api.openweathermap.org/data/2.5/weather?lat={location['lat']}&lon={location['lon']}"
-            location_name = location['city']
-        
-        # Fetch weather data
-        url += f"&appid={OPENWEATHER_API_KEY}&units=metric"
-        response = requests.get(url, timeout=10)
-        
-        if response.status_code != 200:
-            return jsonify({'error': 'Weather data unavailable'}), 503
-        
-        weather_data = response.json()
-        
-        # Apply unit conversion if user has preferences
-        if user and user.preferences:
-            units = user.preferences.get('units', {})
-            weather_data['main'] = convert_units(weather_data['main'], units)
-            if 'wind' in weather_data:
-                weather_data['wind'] = convert_units(weather_data['wind'], units)
-        
-        # Get additional data
-        weather_condition = weather_data['weather'][0]['main']
-        temp = weather_data['main']['temp']
-        
-        # Get personalized greeting
-        greeting = get_personalized_greeting(user, weather_condition, temp)
-        
-        # Get activities
-        activities = get_weather_activities(weather_condition, temp)
-        
-        # Get background sound
-        sound_url = get_weather_sounds(weather_condition)
-        
-        # Check alert triggers
-        if user:
-            check_alert_triggers(user, weather_data)
-        
-        # Log weather check if user is authenticated
-        if user:
-            log = WeatherLog(
-                user_id=user.id,
-                location=location_name,
-                weather_data=weather_data
-            )
-            db.session.add(log)
-            db.session.commit()
-        
-        return jsonify({
-            'location': location_name,
-            'weather': weather_data,
-            'greeting': greeting,
-            'activities': activities,
-            'sound_url': sound_url,
-            'timestamp': datetime.utcnow().isoformat()
-        }), 200
-        
-    except Exception as e:
-        logger.error(f"Weather fetch error: {e}")
-        return jsonify({'error': 'Failed to fetch weather data'}), 500
+        uv_response = requests.get(uv_url, params=uv_params, timeout=5)
+        uv_index = uv_response.json().get('value', 0) if uv_response.status_code == 200 else 0
+    except:
+        uv_index = 0
+    
+    result = {
+        'location': {
+            'name': weather_data.get('name', location_name),
+            'country': weather_data.get('sys', {}).get('country'),
+            'coordinates': {'lat': lat, 'lon': lon},
+            'timezone': weather_data.get('timezone')
+        },
+        'current': {
+            'temperature': weather_data['main']['temp'],
+            'feels_like': weather_data['main']['feels_like'],
+            'temp_min': weather_data['main']['temp_min'],
+            'temp_max': weather_data['main']['temp_max'],
+            'pressure': weather_data['main']['pressure'],
+            'humidity': weather_data['main']['humidity'],
+            'visibility': weather_data.get('visibility', 10000),
+            'uv_index': uv_index,
+            'clouds': weather_data['clouds']['all'],
+            'wind': {
+                'speed': weather_data['wind']['speed'],
+                'direction': weather_data['wind'].get('deg', 0),
+                'gust': weather_data['wind'].get('gust')
+            },
+            'condition': weather_data['weather'][0]['main'],
+            'description': weather_data['weather'][0]['description'],
+            'icon': weather_data['weather'][0]['icon'],
+            'sunrise': weather_data['sys']['sunrise'],
+            'sunset': weather_data['sys']['sunset']
+        },
+        'activities': get_activity_suggestions(
+            weather_data['main']['temp'],
+            weather_data['weather'][0]['main'],
+            weather_data['wind']['speed']
+        ),
+        'playlist': get_weather_playlist(weather_data['weather'][0]['main']),
+        'sounds': get_weather_sounds(weather_data['weather'][0]['main']),
+        'fun_fact': get_weather_fun_facts(),
+        'timestamp': datetime.now(timezone.utc).isoformat()
+    }
+    
+    if g.user:
+        check_and_trigger_alerts(g.user, weather_data)
+    
+    return jsonify(result)
 
-@app.route('/api/weather/forecast', methods=['GET'])
-@rate_limit(max_requests=30, window=60)
+@app.route('/api/v1/weather/forecast', methods=['GET'])
+@limiter.limit("50 per hour")
+@validate_request(WeatherRequestSchema)
 def get_forecast():
-    """Get 7-day weather forecast with hourly breakdown"""
-    try:
-        lat = request.args.get('lat')
-        lon = request.args.get('lon')
-        city = request.args.get('city')
-        include_hourly = request.args.get('hourly', 'false').lower() == 'true'
+    data = g.validated_data
+    
+    if data.get('lat') and data.get('lon'):
+        lat, lon = data['lat'], data['lon']
+    elif data.get('city'):
+        geocode_url = f"http://api.openweathermap.org/geo/1.0/direct"
+        params = {'q': data['city'], 'limit': 1, 'appid': app.config['OPENWEATHER_API_KEY']}
         
-        if lat and lon:
-            # One Call API for detailed forecast
-            url = f"https://api.openweathermap.org/data/3.0/onecall?lat={lat}&lon={lon}"
-            url += f"&exclude=minutely,alerts&appid={OPENWEATHER_API_KEY}&units=metric"
-        elif city:
-            # First get coordinates for the city
-            geo_url = f"https://api.openweathermap.org/geo/1.0/direct?q={city}&limit=1&appid={OPENWEATHER_API_KEY}"
-            geo_response = requests.get(geo_url, timeout=10)
-            if geo_response.status_code == 200 and geo_response.json():
-                geo_data = geo_response.json()[0]
-                lat, lon = geo_data['lat'], geo_data['lon']
-                url = f"https://api.openweathermap.org/data/3.0/onecall?lat={lat}&lon={lon}"
-                url += f"&exclude=minutely,alerts&appid={OPENWEATHER_API_KEY}&units=metric"
-            else:
-                # Fallback to 5-day forecast
-                url = f"https://api.openweathermap.org/data/2.5/forecast?q={city}&appid={OPENWEATHER_API_KEY}&units=metric"
-        else:
-            # Auto-detect location
-            location = get_user_location()
-            url = f"https://api.openweathermap.org/data/3.0/onecall?lat={location['lat']}&lon={location['lon']}"
-            url += f"&exclude=minutely,alerts&appid={OPENWEATHER_API_KEY}&units=metric"
-        
-        response = requests.get(url, timeout=10)
-        
-        if response.status_code != 200:
-            # Fallback to 5-day forecast API
-            if city:
-                url = f"https://api.openweathermap.org/data/2.5/forecast?q={city}&appid={OPENWEATHER_API_KEY}&units=metric"
-            else:
-                location = get_user_location()
-                url = f"https://api.openweathermap.org/data/2.5/forecast?lat={location['lat']}&lon={location['lon']}&appid={OPENWEATHER_API_KEY}&units=metric"
+        try:
+            response = requests.get(geocode_url, params=params, timeout=5)
+            response.raise_for_status()
+            geo_data = response.json()
             
-            response = requests.get(url, timeout=10)
-        
-        if response.status_code != 200:
-            return jsonify({'error': 'Forecast data unavailable'}), 503
-        
-        forecast_data = response.json()
-        
-        # Format response based on API version
-        if 'daily' in forecast_data:
-            # One Call API response
-            result = {
-                'daily': forecast_data['daily'][:7],
-                'current': forecast_data.get('current', {}),
-                'timezone': forecast_data.get('timezone', 'UTC')
-            }
-            if include_hourly:
-                result['hourly'] = forecast_data.get('hourly', [])[:48]
-        else:
-            # 5-day forecast API response
-            result = {
-                'list': forecast_data['list'],
-                'city': forecast_data.get('city', {})
-            }
-        
-        return jsonify(result), 200
-        
-    except Exception as e:
-        logger.error(f"Forecast fetch error: {e}")
-        return jsonify({'error': 'Failed to fetch forecast data'}), 500
+            if not geo_data:
+                raise ResourceNotFoundError('City not found')
+            
+            lat, lon = geo_data[0]['lat'], geo_data[0]['lon']
+        except requests.RequestException:
+            raise ExternalAPIError('Geocoding service unavailable')
+    else:
+        location = get_user_location_from_ip(request.remote_addr)
+        lat, lon = location['latitude'], location['longitude']
+    
+    forecast_data = fetch_forecast_data(lat, lon, data['units'], data['lang'])
+    
+    result = {
+        'location': {
+            'coordinates': {'lat': lat, 'lon': lon},
+            'timezone': forecast_data.get('timezone')
+        },
+        'daily': [{
+            'date': datetime.fromtimestamp(day['dt']).date().isoformat(),
+            'summary': day['summary'] if 'summary' in day else day['weather'][0]['description'],
+            'temperatures': {
+                'min': day['temp']['min'],
+                'max': day['temp']['max'],
+                'morning': day['temp']['morn'],
+                'day': day['temp']['day'],
+                'evening': day['temp']['eve'],
+                'night': day['temp']['night']
+            },
+            'feels_like': {
+                'morning': day['feels_like']['morn'],
+                'day': day['feels_like']['day'],
+                'evening': day['feels_like']['eve'],
+                'night': day['feels_like']['night']
+            },
+            'humidity': day['humidity'],
+            'wind_speed': day['wind_speed'],
+            'wind_direction': day['wind_deg'],
+            'weather': {
+                'main': day['weather'][0]['main'],
+                'description': day['weather'][0]['description'],
+                'icon': day['weather'][0]['icon']
+            },
+            'clouds': day['clouds'],
+            'precipitation_probability': day.get('pop', 0),
+            'rain': day.get('rain', 0),
+            'snow': day.get('snow', 0),
+            'uv_index': day.get('uvi', 0),
+            'sunrise': day['sunrise'],
+            'sunset': day['sunset']
+        } for day in forecast_data.get('daily', [])[:7]],
+        'hourly': [{
+            'time': datetime.fromtimestamp(hour['dt']).isoformat(),
+            'temperature': hour['temp'],
+            'feels_like': hour['feels_like'],
+            'humidity': hour['humidity'],
+            'clouds': hour['clouds'],
+            'wind_speed': hour['wind_speed'],
+            'weather': {
+                'main': hour['weather'][0]['main'],
+                'description': hour['weather'][0]['description'],
+                'icon': hour['weather'][0]['icon']
+            },
+            'precipitation_probability': hour.get('pop', 0)
+        } for hour in forecast_data.get('hourly', [])[:24]],
+        'alerts': forecast_data.get('alerts', []),
+        'timestamp': datetime.now(timezone.utc).isoformat()
+    }
+    
+    return jsonify(result)
 
-@app.route('/api/weather/historical', methods=['GET'])
-@token_required
-@rate_limit(max_requests=10, window=60)
+@app.route('/api/v1/weather/historical', methods=['GET'])
+@limiter.limit("20 per hour")
+@require_auth
 def get_historical_weather():
-    """Get historical weather data (past 7-30 days)"""
-    try:
-        lat = request.args.get('lat', type=float)
-        lon = request.args.get('lon', type=float)
-        days = request.args.get('days', 7, type=int)
+    lat = request.args.get('lat', type=float)
+    lon = request.args.get('lon', type=float)
+    days = min(request.args.get('days', 7, type=int), 30)
+    
+    if not lat or not lon:
+        location = get_user_location_from_ip(request.remote_addr)
+        lat, lon = location['latitude'], location['longitude']
+    
+    historical_data = []
+    
+    for i in range(1, days + 1):
+        timestamp = int((datetime.now(timezone.utc) - timedelta(days=i)).timestamp())
         
-        if not lat or not lon:
-            return jsonify({'error': 'Latitude and longitude required'}), 400
+        cache_key = f'historical:{lat}:{lon}:{timestamp}'
+        cached = redis_client.get(cache_key)
         
-        if days < 1 or days > 30:
-            return jsonify({'error': 'Days must be between 1 and 30'}), 400
-        
-        historical_data = []
-        
-        for i in range(1, days + 1):
-            dt = int((datetime.utcnow() - timedelta(days=i)).timestamp())
-            url = f"https://api.openweathermap.org/data/3.0/onecall/timemachine"
-            url += f"?lat={lat}&lon={lon}&dt={dt}&appid={OPENWEATHER_API_KEY}&units=metric"
-            
-            response = requests.get(url, timeout=10)
-            if response.status_code == 200:
-                historical_data.append(response.json())
-        
-        return jsonify({
-            'historical': historical_data,
-            'days': days,
-            'location': {'lat': lat, 'lon': lon}
-        }), 200
-        
-    except Exception as e:
-        logger.error(f"Historical weather error: {e}")
-        return jsonify({'error': 'Failed to fetch historical data'}), 500
-
-@app.route('/api/weather/alerts', methods=['GET'])
-@rate_limit(max_requests=30, window=60)
-def get_weather_alerts():
-    """Get severe weather alerts for a location"""
-    try:
-        lat = request.args.get('lat')
-        lon = request.args.get('lon')
-        
-        if not lat or not lon:
-            location = get_user_location()
-            lat, lon = location['lat'], location['lon']
-        
-        # One Call API includes alerts
-        url = f"https://api.openweathermap.org/data/3.0/onecall?lat={lat}&lon={lon}"
-        url += f"&exclude=minutely,current,hourly,daily&appid={OPENWEATHER_API_KEY}"
-        
-        response = requests.get(url, timeout=10)
-        
-        if response.status_code == 200:
-            data = response.json()
-            alerts = data.get('alerts', [])
-            
-            # Format alerts
-            formatted_alerts = []
-            for alert in alerts:
-                formatted_alerts.append({
-                    'sender': alert.get('sender_name', 'Weather Service'),
-                    'event': alert.get('event', 'Weather Alert'),
-                    'start': datetime.fromtimestamp(alert.get('start', 0)).isoformat(),
-                    'end': datetime.fromtimestamp(alert.get('end', 0)).isoformat(),
-                    'description': alert.get('description', ''),
-                    'tags': alert.get('tags', [])
-                })
-            
-            return jsonify({
-                'alerts': formatted_alerts,
-                'location': {'lat': lat, 'lon': lon},
-                'timestamp': datetime.utcnow().isoformat()
-            }), 200
-        
-        return jsonify({'alerts': [], 'message': 'No alerts available'}), 200
-        
-    except Exception as e:
-        logger.error(f"Weather alerts error: {e}")
-        return jsonify({'error': 'Failed to fetch alerts'}), 500
-
-@app.route('/api/weather/global-random', methods=['GET'])
-@rate_limit(max_requests=30, window=60)
-def get_random_global_weather():
-    """Get weather from a random global city"""
-    try:
-        cities = [
-            {'name': 'Tokyo', 'country': 'JP'},
-            {'name': 'Paris', 'country': 'FR'},
-            {'name': 'Sydney', 'country': 'AU'},
-            {'name': 'Cairo', 'country': 'EG'},
-            {'name': 'Moscow', 'country': 'RU'},
-            {'name': 'Rio de Janeiro', 'country': 'BR'},
-            {'name': 'Mumbai', 'country': 'IN'},
-            {'name': 'Cape Town', 'country': 'ZA'},
-            {'name': 'Dubai', 'country': 'AE'},
-            {'name': 'Reykjavik', 'country': 'IS'},
-            {'name': 'Bangkok', 'country': 'TH'},
-            {'name': 'Mexico City', 'country': 'MX'},
-            {'name': 'Stockholm', 'country': 'SE'},
-            {'name': 'Seoul', 'country': 'KR'},
-            {'name': 'Buenos Aires', 'country': 'AR'},
-            {'name': 'Singapore', 'country': 'SG'},
-            {'name': 'Toronto', 'country': 'CA'},
-            {'name': 'Berlin', 'country': 'DE'},
-            {'name': 'Rome', 'country': 'IT'},
-            {'name': 'Amsterdam', 'country': 'NL'}
-        ]
-        
-        city = random.choice(cities)
-        
-        url = f"https://api.openweathermap.org/data/2.5/weather?q={city['name']},{city['country']}"
-        url += f"&appid={OPENWEATHER_API_KEY}&units=metric"
-        
-        response = requests.get(url, timeout=10)
-        
-        if response.status_code == 200:
-            weather_data = response.json()
-            
-            # Add interesting fact about the city
-            city_facts = {
-                'Tokyo': 'The world\'s most populous metropolitan area!',
-                'Paris': 'The City of Light averages 1,662 hours of sunshine per year.',
-                'Sydney': 'Home to the world-famous Opera House and Harbour Bridge!',
-                'Cairo': 'One of the hottest cities in the world during summer.',
-                'Moscow': 'Can experience temperatures below -25°C in winter!',
-                'Rio de Janeiro': 'Famous for its carnival and beautiful beaches.',
-                'Mumbai': 'Experiences heavy monsoon rains from June to September.',
-                'Cape Town': 'Has a Mediterranean climate with dry summers.',
-                'Dubai': 'One of the world\'s hottest cities with summer temps over 45°C!',
-                'Reykjavik': 'The world\'s northernmost capital city.',
-                'Bangkok': 'Known as one of the hottest cities year-round.',
-                'Mexico City': 'At 2,250m elevation, it has mild temperatures year-round.',
-                'Stockholm': 'Built on 14 islands connected by 57 bridges!',
-                'Seoul': 'Experiences four distinct seasons.',
-                'Buenos Aires': 'Has a humid subtropical climate.',
-                'Singapore': 'Tropical climate with high humidity year-round.',
-                'Toronto': 'Can have temperature swings of 30°C between seasons!',
-                'Berlin': 'Continental climate with warm summers and cold winters.',
-                'Rome': 'Enjoys a Mediterranean climate with hot, dry summers.',
-                'Amsterdam': 'Known for its rainy weather and cycling culture!'
+        if cached:
+            historical_data.append(json.loads(cached))
+        else:
+            url = f"https://api.openweathermap.org/data/2.5/onecall/timemachine"
+            params = {
+                'lat': lat,
+                'lon': lon,
+                'dt': timestamp,
+                'appid': app.config['OPENWEATHER_API_KEY'],
+                'units': 'metric'
             }
             
-            return jsonify({
-                'city': city,
-                'weather': weather_data,
-                'fact': city_facts.get(city['name'], 'A fascinating city with unique weather!'),
-                'timestamp': datetime.utcnow().isoformat()
-            }), 200
-        
-        return jsonify({'error': 'Failed to fetch global weather'}), 503
-        
-    except Exception as e:
-        logger.error(f"Global weather error: {e}")
-        return jsonify({'error': 'Failed to fetch global weather'}), 500
-
-@app.route('/api/user/preferences', methods=['GET', 'PUT'])
-@token_required
-def user_preferences():
-    """Get or update user preferences"""
-    try:
-        user = g.current_user
-        
-        if request.method == 'GET':
-            return jsonify({
-                'preferences': user.preferences,
-                'streak': user.streak_count,
-                'last_active': user.last_active.isoformat() if user.last_active else None
-            }), 200
-        
-        elif request.method == 'PUT':
-            data = request.json
-            
-            # Update preferences
-            if 'units' in data:
-                user.preferences['units'] = data['units']
-            if 'theme' in data:
-                user.preferences['theme'] = data['theme']
-            if 'language' in data:
-                user.preferences['language'] = data['language']
-            if 'favorite_locations' in data:
-                user.preferences['favorite_locations'] = data['favorite_locations']
-            if 'weather_mood' in data:
-                user.preferences['weather_mood'] = data['weather_mood']
-            if 'notifications_enabled' in data:
-                user.preferences['notifications_enabled'] = data['notifications_enabled']
-            if 'alert_triggers' in data:
-                user.preferences['alert_triggers'] = data['alert_triggers']
-            
-            db.session.commit()
-            
-            return jsonify({
-                'message': 'Preferences updated',
-                'preferences': user.preferences
-            }), 200
-            
-    except Exception as e:
-        logger.error(f"Preferences error: {e}")
-        return jsonify({'error': 'Failed to handle preferences'}), 500
-
-@app.route('/api/user/alerts', methods=['GET', 'POST', 'PUT', 'DELETE'])
-@token_required
-def manage_alerts():
-    """Manage user weather alerts"""
-    try:
-        user = g.current_user
-        
-        if request.method == 'GET':
-            alerts = Alert.query.filter_by(user_id=user.id).all()
-            return jsonify({
-                'alerts': [{
-                    'id': a.id,
-                    'type': a.type,
-                    'condition': a.condition,
-                    'location': a.location,
-                    'enabled': a.enabled,
-                    'last_triggered': a.last_triggered.isoformat() if a.last_triggered else None
-                } for a in alerts]
-            }), 200
-        
-        elif request.method == 'POST':
-            data = request.json
-            alert = Alert(
-                user_id=user.id,
-                type=data.get('type'),
-                condition=data.get('condition', {}),
-                location=data.get('location', 'Current Location'),
-                enabled=data.get('enabled', True)
-            )
-            db.session.add(alert)
-            db.session.commit()
-            
-            return jsonify({
-                'message': 'Alert created',
-                'alert_id': alert.id
-            }), 201
-        
-        elif request.method == 'PUT':
-            alert_id = request.json.get('alert_id')
-            alert = Alert.query.filter_by(id=alert_id, user_id=user.id).first()
-            
-            if not alert:
-                return jsonify({'error': 'Alert not found'}), 404
-            
-            data = request.json
-            if 'enabled' in data:
-                alert.enabled = data['enabled']
-            if 'condition' in data:
-                alert.condition = data['condition']
-            if 'location' in data:
-                alert.location = data['location']
-            
-            db.session.commit()
-            return jsonify({'message': 'Alert updated'}), 200
-        
-        elif request.method == 'DELETE':
-            alert_id = request.args.get('alert_id')
-            alert = Alert.query.filter_by(id=alert_id, user_id=user.id).first()
-            
-            if not alert:
-                return jsonify({'error': 'Alert not found'}), 404
-            
-            db.session.delete(alert)
-            db.session.commit()
-            return jsonify({'message': 'Alert deleted'}), 200
-            
-    except Exception as e:
-        logger.error(f"Alert management error: {e}")
-        return jsonify({'error': 'Failed to manage alerts'}), 500
-
-@app.route('/api/user/logs', methods=['GET', 'POST'])
-@token_required
-def weather_logs():
-    """Get or create weather logs/journal entries"""
-    try:
-        user = g.current_user
-        
-        if request.method == 'GET':
-            page = request.args.get('page', 1, type=int)
-            per_page = request.args.get('per_page', 10, type=int)
-            
-            logs = WeatherLog.query.filter_by(user_id=user.id)\
-                .order_by(WeatherLog.created_at.desc())\
-                .paginate(page=page, per_page=per_page, error_out=False)
-            
-            return jsonify({
-                'logs': [{
-                    'id': log.id,
-                    'location': log.location,
-                    'weather_data': log.weather_data,
-                    'mood': log.mood,
-                    'note': log.note,
-                    'photo_url': log.photo_url,
-                    'created_at': log.created_at.isoformat()
-                } for log in logs.items],
-                'total': logs.total,
-                'pages': logs.pages,
-                'current_page': page
-            }), 200
-        
-        elif request.method == 'POST':
-            data = request.json
-            log = WeatherLog(
-                user_id=user.id,
-                location=data.get('location'),
-                weather_data=data.get('weather_data', {}),
-                mood=data.get('mood'),
-                note=data.get('note'),
-                photo_url=data.get('photo_url')
-            )
-            db.session.add(log)
-            db.session.commit()
-            
-            return jsonify({
-                'message': 'Log created',
-                'log_id': log.id
-            }), 201
-            
-    except Exception as e:
-        logger.error(f"Weather logs error: {e}")
-        return jsonify({'error': 'Failed to manage logs'}), 500
-
-@app.route('/api/entertainment/fun-fact', methods=['GET'])
-@rate_limit(max_requests=30, window=60)
-def get_fun_fact():
-    """Get daily weather fun fact"""
-    try:
-        fact = get_weather_fun_fact()
-        return jsonify({
-            'fact': fact,
-            'timestamp': datetime.utcnow().isoformat()
-        }), 200
-    except Exception as e:
-        logger.error(f"Fun fact error: {e}")
-        return jsonify({'error': 'Failed to get fun fact'}), 500
-
-@app.route('/api/entertainment/activities', methods=['GET'])
-@rate_limit(max_requests=30, window=60)
-def get_activities():
-    """Get activity suggestions based on current weather"""
-    try:
-        # Get weather data
-        lat = request.args.get('lat')
-        lon = request.args.get('lon')
-        city = request.args.get('city')
-        
-        if lat and lon:
-            url = f"https://api.openweathermap.org/data/2.5/weather?lat={lat}&lon={lon}"
-        elif city:
-            url = f"https://api.openweathermap.org/data/2.5/weather?q={city}"
-        else:
-            location = get_user_location()
-            url = f"https://api.openweathermap.org/data/2.5/weather?lat={location['lat']}&lon={location['lon']}"
-        
-        url += f"&appid={OPENWEATHER_API_KEY}&units=metric"
-        response = requests.get(url, timeout=10)
-        
-        if response.status_code == 200:
-            weather_data = response.json()
-            weather_condition = weather_data['weather'][0]['main']
-            temp = weather_data['main']['temp']
-            
-            activities = get_weather_activities(weather_condition, temp)
-            
-            return jsonify({
-                'activities': activities,
-                'weather': weather_condition,
-                'temperature': temp,
-                'timestamp': datetime.utcnow().isoformat()
-            }), 200
-        
-        return jsonify({'error': 'Failed to get weather for activities'}), 503
-        
-    except Exception as e:
-        logger.error(f"Activities error: {e}")
-        return jsonify({'error': 'Failed to get activities'}), 500
-
-@app.route('/api/entertainment/spotify-playlist', methods=['GET'])
-@rate_limit(max_requests=20, window=60)
-def get_spotify_playlist():
-    """Get Spotify playlist based on weather"""
-    try:
-        if not SPOTIFY_CLIENT_ID or not SPOTIFY_CLIENT_SECRET:
-            return jsonify({'error': 'Spotify integration not configured'}), 503
-        
-        # Get weather data
-        weather_condition = request.args.get('weather', 'Clear')
-        
-        # Get Spotify token
-        token = get_spotify_token()
-        if not token:
-            return jsonify({'error': 'Failed to authenticate with Spotify'}), 503
-        
-        # Get playlist for weather
-        playlist_info = get_weather_playlist(weather_condition)
-        
-        # Search for playlists
-        headers = {'Authorization': f'Bearer {token}'}
-        search_url = f"https://api.spotify.com/v1/search?q={playlist_info['query']}&type=playlist&limit=5"
-        
-        response = requests.get(search_url, headers=headers, timeout=10)
-        
-        if response.status_code == 200:
-            data = response.json()
-            playlists = data.get('playlists', {}).get('items', [])
-            
-            formatted_playlists = []
-            for playlist in playlists:
-                formatted_playlists.append({
-                    'id': playlist['id'],
-                    'name': playlist['name'],
-                    'description': playlist.get('description', ''),
-                    'url': playlist['external_urls']['spotify'],
-                    'image': playlist['images'][0]['url'] if playlist.get('images') else None,
-                    'tracks_total': playlist['tracks']['total']
-                })
-            
-            return jsonify({
-                'weather': weather_condition,
-                'theme': playlist_info['name'],
-                'playlists': formatted_playlists
-            }), 200
-        
-        return jsonify({'error': 'Failed to fetch playlists'}), 503
-        
-    except Exception as e:
-        logger.error(f"Spotify playlist error: {e}")
-        return jsonify({'error': 'Failed to get playlist'}), 500
-
-@app.route('/api/entertainment/background-sounds', methods=['GET'])
-@rate_limit(max_requests=30, window=60)
-def get_background_sounds():
-    """Get background sound URLs based on weather"""
-    try:
-        weather_condition = request.args.get('weather', 'Clear')
-        sound_url = get_weather_sounds(weather_condition)
-        
-        # Additional sound variations
-        all_sounds = {
-            'Clear': [
-                {'name': 'Birds Chirping', 'url': sound_url},
-                {'name': 'Beach Waves', 'url': 'https://cdn.pixabay.com/audio/2022/06/07/audio_d963871e0b.mp3'},
-                {'name': 'Forest Ambience', 'url': 'https://cdn.pixabay.com/audio/2022/03/10/audio_6ba5e7b591.mp3'}
-            ],
-            'Rain': [
-                {'name': 'Rain on Window', 'url': sound_url},
-                {'name': 'Soft Rain', 'url': 'https://cdn.pixabay.com/audio/2022/05/13/audio_1f94ff8fb8.mp3'},
-                {'name': 'Rain with Thunder', 'url': 'https://cdn.pixabay.com/audio/2021/08/04/audio_bb84e53e0e.mp3'}
-            ],
-            'Snow': [
-                {'name': 'Fireplace Crackling', 'url': sound_url},
-                {'name': 'Winter Wind', 'url': 'https://cdn.pixabay.com/audio/2021/08/04/audio_12b0c7443c.mp3'},
-                {'name': 'Cozy Cabin', 'url': 'https://cdn.pixabay.com/audio/2022/11/21/audio_c0cccb4c6f.mp3'}
-            ],
-            'Thunderstorm': [
-                {'name': 'Thunder Storm', 'url': sound_url},
-                {'name': 'Distant Thunder', 'url': 'https://cdn.pixabay.com/audio/2022/08/25/audio_cbf4d43ec8.mp3'},
-                {'name': 'Heavy Rain', 'url': 'https://cdn.pixabay.com/audio/2022/05/13/audio_257112ce99.mp3'}
-            ]
-        }
-        
-        sounds = all_sounds.get(weather_condition, all_sounds['Clear'])
-        
-        return jsonify({
-            'weather': weather_condition,
-            'sounds': sounds,
-            'primary_sound': sound_url
-        }), 200
-        
-    except Exception as e:
-        logger.error(f"Background sounds error: {e}")
-        return jsonify({'error': 'Failed to get sounds'}), 500
-
-@app.route('/api/stats/streak', methods=['GET'])
-@token_required
-def get_streak():
-    """Get user's daily streak"""
-    try:
-        user = g.current_user
-        user.update_streak()
-        db.session.commit()
-        
-        return jsonify({
-            'streak': user.streak_count,
-            'last_active': user.last_active.isoformat() if user.last_active else None,
-            'badges': []  # Can be expanded with achievement system
-        }), 200
-        
-    except Exception as e:
-        logger.error(f"Streak error: {e}")
-        return jsonify({'error': 'Failed to get streak'}), 500
-
-@app.route('/api/travel/recommendations', methods=['GET'])
-@rate_limit(max_requests=20, window=60)
-def get_travel_recommendations():
-    """Get travel recommendations based on weather preferences"""
-    try:
-        preference = request.args.get('preference', 'sunny')  # sunny, cold, mild, tropical
-        
-        recommendations = {
-            'sunny': [
-                {'city': 'Barcelona', 'country': 'Spain', 'reason': 'Mediterranean sunshine and beaches'},
-                {'city': 'San Diego', 'country': 'USA', 'reason': 'Year-round perfect weather'},
-                {'city': 'Perth', 'country': 'Australia', 'reason': 'Sunny days and beautiful beaches'},
-                {'city': 'Tel Aviv', 'country': 'Israel', 'reason': 'Mediterranean climate with 300+ sunny days'},
-                {'city': 'Cape Town', 'country': 'South Africa', 'reason': 'Stunning scenery with great weather'}
-            ],
-            'cold': [
-                {'city': 'Reykjavik', 'country': 'Iceland', 'reason': 'Northern lights and winter wonders'},
-                {'city': 'Helsinki', 'country': 'Finland', 'reason': 'Winter activities and cozy culture'},
-                {'city': 'Quebec City', 'country': 'Canada', 'reason': 'Winter carnival and French charm'},
-                {'city': 'Tromsø', 'country': 'Norway', 'reason': 'Arctic adventures and midnight sun'},
-                {'city': 'Sapporo', 'country': 'Japan', 'reason': 'Snow festival and winter sports'}
-            ],
-            'mild': [
-                {'city': 'San Francisco', 'country': 'USA', 'reason': 'Cool summers and mild winters'},
-                {'city': 'Edinburgh', 'country': 'Scotland', 'reason': 'Temperate climate with historic charm'},
-                {'city': 'Vancouver', 'country': 'Canada', 'reason': 'Mild coastal climate year-round'},
-                {'city': 'Auckland', 'country': 'New Zealand', 'reason': 'Oceanic climate with mild seasons'},
-                {'city': 'Portland', 'country': 'USA', 'reason': 'Mild temperatures and nature access'}
-            ],
-            'tropical': [
-                {'city': 'Bali', 'country': 'Indonesia', 'reason': 'Tropical paradise with warm weather'},
-                {'city': 'Phuket', 'country': 'Thailand', 'reason': 'Beach resorts and tropical climate'},
-                {'city': 'Maldives', 'country': 'Maldives', 'reason': 'Island paradise with perfect weather'},
-                {'city': 'Cancun', 'country': 'Mexico', 'reason': 'Caribbean beaches and Mayan culture'},
-                {'city': 'Maui', 'country': 'USA', 'reason': 'Hawaiian paradise with year-round warmth'}
-            ]
-        }
-        
-        selected = recommendations.get(preference, recommendations['sunny'])
-        
-        # Get current weather for top 3 recommendations
-        weather_data = []
-        for dest in selected[:3]:
             try:
-                url = f"https://api.openweathermap.org/data/2.5/weather?q={dest['city']},{dest['country']}"
-                url += f"&appid={OPENWEATHER_API_KEY}&units=metric"
-                response = requests.get(url, timeout=5)
+                response = requests.get(url, params=params, timeout=10)
                 if response.status_code == 200:
                     data = response.json()
-                    dest['current_weather'] = {
-                        'temp': data['main']['temp'],
-                        'description': data['weather'][0]['description'],
-                        'icon': data['weather'][0]['icon']
-                    }
-            except:
-                pass
-            weather_data.append(dest)
+                    if 'current' in data:
+                        day_data = {
+                            'date': datetime.fromtimestamp(data['current']['dt']).date().isoformat(),
+                            'temperature': data['current']['temp'],
+                            'feels_like': data['current']['feels_like'],
+                            'humidity': data['current']['humidity'],
+                            'wind_speed': data['current']['wind_speed'],
+                            'weather': data['current']['weather'][0] if data['current']['weather'] else {}
+                        }
+                        historical_data.append(day_data)
+                        redis_client.setex(cache_key, 86400, json.dumps(day_data))
+            except Exception as e:
+                logger.error(f'Historical weather error: {str(e)}')
+    
+    return jsonify({
+        'location': {'lat': lat, 'lon': lon},
+        'days_requested': days,
+        'days_returned': len(historical_data),
+        'data': historical_data
+    })
+
+@app.route('/api/v1/weather/global-random', methods=['GET'])
+@limiter.limit("30 per hour")
+@cache.cached(timeout=1800)
+def get_random_global_weather():
+    cities = [
+        {'name': 'Tokyo', 'country': 'JP', 'timezone': 'Asia/Tokyo'},
+        {'name': 'London', 'country': 'GB', 'timezone': 'Europe/London'},
+        {'name': 'New York', 'country': 'US', 'timezone': 'America/New_York'},
+        {'name': 'Paris', 'country': 'FR', 'timezone': 'Europe/Paris'},
+        {'name': 'Sydney', 'country': 'AU', 'timezone': 'Australia/Sydney'},
+        {'name': 'Dubai', 'country': 'AE', 'timezone': 'Asia/Dubai'},
+        {'name': 'Singapore', 'country': 'SG', 'timezone': 'Asia/Singapore'},
+        {'name': 'Mumbai', 'country': 'IN', 'timezone': 'Asia/Kolkata'},
+        {'name': 'São Paulo', 'country': 'BR', 'timezone': 'America/Sao_Paulo'},
+        {'name': 'Cairo', 'country': 'EG', 'timezone': 'Africa/Cairo'}
+    ]
+    
+    city = random.choice(cities)
+    
+    try:
+        url = f"https://api.openweathermap.org/data/2.5/weather"
+        params = {
+            'q': f"{city['name']},{city['country']}",
+            'appid': app.config['OPENWEATHER_API_KEY'],
+            'units': 'metric'
+        }
+        
+        response = requests.get(url, params=params, timeout=10)
+        response.raise_for_status()
+        data = response.json()
         
         return jsonify({
-            'preference': preference,
-            'recommendations': weather_data + selected[3:],
-            'timestamp': datetime.utcnow().isoformat()
-        }), 200
+            'city': city['name'],
+            'country': city['country'],
+            'timezone': city['timezone'],
+            'temperature': data['main']['temp'],
+            'feels_like': data['main']['feels_like'],
+            'humidity': data['main']['humidity'],
+            'weather': {
+                'main': data['weather'][0]['main'],
+                'description': data['weather'][0]['description'],
+                'icon': data['weather'][0]['icon']
+            },
+            'wind_speed': data['wind']['speed'],
+            'local_time': datetime.fromtimestamp(
+                data['dt'] + data['timezone']
+            ).strftime('%H:%M'),
+            'message': f"Right now in {city['name']}, it's {data['main']['temp']}°C with {data['weather'][0]['description']}"
+        })
         
     except Exception as e:
-        logger.error(f"Travel recommendations error: {e}")
-        return jsonify({'error': 'Failed to get recommendations'}), 500
+        logger.error(f'Global weather error: {str(e)}')
+        raise ExternalAPIError('Failed to fetch global weather')
 
-# ======================= DATABASE INITIALIZATION =======================
+@app.route('/api/v1/user/profile', methods=['GET'])
+@require_auth
+def get_user_profile():
+    return jsonify({
+        'user': UserSchema().dump(g.user),
+        'preferences': g.user.preferences,
+        'stats': {
+            'streak_count': g.user.streak_count,
+            'max_streak': g.user.max_streak,
+            'total_checks': g.user.total_checks,
+            'member_since': g.user.created_at.isoformat()
+        }
+    })
 
-@app.before_first_request
-def create_tables():
-    """Create database tables if they don't exist"""
-    try:
-        db.create_all()
-        logger.info("Database tables created successfully")
-    except Exception as e:
-        logger.error(f"Database initialization error: {e}")
+@app.route('/api/v1/user/preferences', methods=['PUT'])
+@require_auth
+@audit_log('user.preferences.update', 'user')
+def update_preferences():
+    data = request.json
+    
+    if not data:
+        raise ValidationError('No data provided')
+    
+    allowed_keys = ['units', 'theme', 'language', 'notifications', 'favorite_locations']
+    
+    for key in allowed_keys:
+        if key in data:
+            g.user.preferences[key] = data[key]
+    
+    db.session.commit()
+    
+    return jsonify({
+        'message': 'Preferences updated successfully',
+        'preferences': g.user.preferences
+    })
 
-@app.errorhandler(404)
-def not_found(error):
-    return jsonify({'error': 'Endpoint not found'}), 404
+@app.route('/api/v1/user/triggers', methods=['GET'])
+@require_auth
+def get_triggers():
+    triggers = CustomTrigger.query.filter_by(user_id=g.user.id).all()
+    
+    return jsonify({
+        'triggers': [{
+            'id': str(trigger.id),
+            'name': trigger.name,
+            'description': trigger.description,
+            'condition_type': trigger.condition_type,
+            'condition_value': trigger.condition_value,
+            'location': trigger.location,
+            'is_active': trigger.is_active,
+            'last_triggered': trigger.last_triggered.isoformat() if trigger.last_triggered else None,
+            'trigger_count': trigger.trigger_count
+        } for trigger in triggers]
+    })
 
-@app.errorhandler(500)
-def internal_error(error):
-    db.session.rollback()
-    return jsonify({'error': 'Internal server error'}), 500
+@app.route('/api/v1/user/triggers', methods=['POST'])
+@require_auth
+@validate_request(TriggerSchema)
+@audit_log('trigger.create', 'trigger')
+def create_trigger():
+    data = g.validated_data
+    
+    existing = CustomTrigger.query.filter_by(
+        user_id=g.user.id,
+        name=data['name']
+    ).first()
+    
+    if existing:
+        raise ValidationError('Trigger with this name already exists')
+    
+    trigger = CustomTrigger(
+        user_id=g.user.id,
+        name=data['name'],
+        description=data.get('description'),
+        condition_type=data['condition_type'],
+        condition_value=data.get('condition_value'),
+        location=data.get('location'),
+        is_active=data.get('is_active', True)
+    )
+    
+    db.session.add(trigger)
+    db.session.commit()
+    
+    return jsonify({
+        'message': 'Trigger created successfully',
+        'trigger': {
+            'id': str(trigger.id),
+            'name': trigger.name
+        }
+    }), 201
 
-# ======================= MAIN =======================
+@app.route('/api/v1/user/triggers/<trigger_id>', methods=['DELETE'])
+@require_auth
+@audit_log('trigger.delete', 'trigger')
+def delete_trigger(trigger_id):
+    trigger = CustomTrigger.query.filter_by(
+        id=trigger_id,
+        user_id=g.user.id
+    ).first()
+    
+    if not trigger:
+        raise ResourceNotFoundError('Trigger not found')
+    
+    db.session.delete(trigger)
+    db.session.commit()
+    
+    return jsonify({'message': 'Trigger deleted successfully'})
+
+@app.route('/api/v1/user/alerts', methods=['GET'])
+@require_auth
+def get_alerts():
+    page = request.args.get('page', 1, type=int)
+    per_page = min(request.args.get('per_page', 20, type=int), 100)
+    unread_only = request.args.get('unread', 'false').lower() == 'true'
+    
+    query = WeatherAlert.query.filter_by(user_id=g.user.id)
+    
+    if unread_only:
+        query = query.filter_by(is_read=False)
+    
+    alerts = query.order_by(WeatherAlert.created_at.desc()).paginate(
+        page=page,
+        per_page=per_page,
+        error_out=False
+    )
+    
+    return jsonify({
+        'alerts': [{
+            'id': str(alert.id),
+            'type': alert.alert_type,
+            'severity': alert.severity,
+            'title': alert.title,
+            'message': alert.message,
+            'location': alert.location,
+            'is_read': alert.is_read,
+            'created_at': alert.created_at.isoformat()
+        } for alert in alerts.items],
+        'pagination': {
+            'page': alerts.page,
+            'pages': alerts.pages,
+            'per_page': alerts.per_page,
+            'total': alerts.total
+        }
+    })
+
+@app.route('/api/v1/user/alerts/<alert_id>/read', methods=['PUT'])
+@require_auth
+def mark_alert_read(alert_id):
+    alert = WeatherAlert.query.filter_by(
+        id=alert_id,
+        user_id=g.user.id
+    ).first()
+    
+    if not alert:
+        raise ResourceNotFoundError('Alert not found')
+    
+    alert.is_read = True
+    alert.read_at = datetime.now(timezone.utc)
+    db.session.commit()
+    
+    return jsonify({'message': 'Alert marked as read'})
+
+@app.route('/api/v1/user/logs', methods=['GET'])
+@require_auth
+def get_weather_logs():
+    page = request.args.get('page', 1, type=int)
+    per_page = min(request.args.get('per_page', 20, type=int), 100)
+    
+    logs = WeatherLog.query.filter_by(user_id=g.user.id).order_by(
+        WeatherLog.created_at.desc()
+    ).paginate(page=page, per_page=per_page, error_out=False)
+    
+    return jsonify({
+        'logs': [{
+            'id': str(log.id),
+            'location': log.location,
+            'weather_data': log.weather_data,
+            'mood': log.mood,
+            'note': log.note,
+            'tags': log.tags,
+            'created_at': log.created_at.isoformat()
+        } for log in logs.items],
+        'pagination': {
+            'page': logs.page,
+            'pages': logs.pages,
+            'per_page': logs.per_page,
+            'total': logs.total
+        }
+    })
+
+@app.route('/api/v1/user/logs', methods=['POST'])
+@require_auth
+@audit_log('log.create', 'weather_log')
+def create_weather_log():
+    data = request.json
+    
+    if not data or not data.get('location'):
+        raise ValidationError('Location is required')
+    
+    log = WeatherLog(
+        user_id=g.user.id,
+        mood=data.get('mood'),
+        note=data.get('note'),
+        tags=data.get('tags', []),
+        weather_data=data.get('weather_data', {})
+    )
+    log.set_location(data['location'])
+    
+    db.session.add(log)
+    db.session.commit()
+    
+    return jsonify({
+        'message': 'Log created successfully',
+        'log_id': str(log.id)
+    }), 201
+
+@app.route('/api/v1/entertainment/playlist', methods=['GET'])
+@limiter.limit("50 per hour")
+def get_playlist():
+    condition = request.args.get('condition', 'clear')
+    playlist = get_weather_playlist(condition)
+    return jsonify(playlist)
+
+@app.route('/api/v1/entertainment/sounds', methods=['GET'])
+@limiter.limit("50 per hour")
+def get_sounds():
+    condition = request.args.get('condition', 'clear')
+    sounds = get_weather_sounds(condition)
+    return jsonify(sounds)
+
+@app.route('/api/v1/entertainment/activities', methods=['GET'])
+@limiter.limit("50 per hour")
+def get_activities():
+    temp = request.args.get('temperature', 20, type=float)
+    condition = request.args.get('condition', 'clear')
+    wind_speed = request.args.get('wind_speed', 0, type=float)
+    
+    activities = get_activity_suggestions(temp, condition, wind_speed)
+    return jsonify({'activities': activities})
+
+@app.route('/api/v1/entertainment/fact', methods=['GET'])
+@limiter.limit("100 per hour")
+def get_fact():
+    return jsonify(get_weather_fun_facts())
+
+@app.cli.command()
+def init_db():
+    db.create_all()
+    print('Database initialized successfully')
+
+@app.cli.command()
+def seed_db():
+    from datetime import datetime, timedelta
+    import random
+    
+    test_user = User(
+        email='test@example.com',
+        username='testuser',
+        is_verified=True,
+        is_premium=True
+    )
+    test_user.set_password('Test123456')
+    test_user.generate_api_key()
+    
+    db.session.add(test_user)
+    db.session.commit()
+    
+    print(f'Test user created: test@example.com / Test123456')
+    print(f'API Key: {test_user.api_key}')
 
 if __name__ == '__main__':
+    with app.app_context():
+        db.create_all()
+    
     port = int(os.environ.get('PORT', 5000))
     debug = os.environ.get('FLASK_ENV') == 'development'
-    
-    logger.info(f"Starting Weather Visualizer Backend on port {port}")
-    logger.info(f"Debug mode: {debug}")
-    
-    # Check required environment variables
-    if not OPENWEATHER_API_KEY:
-        logger.warning("OPENWEATHER_API_KEY not set - weather features will not work")
-    if not SPOTIFY_CLIENT_ID or not SPOTIFY_CLIENT_SECRET:
-        logger.warning("Spotify credentials not set - music features will not work")
     
     app.run(host='0.0.0.0', port=port, debug=debug)

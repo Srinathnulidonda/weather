@@ -16,7 +16,7 @@ import time
 app = Flask(__name__)
 CORS(app, resources={r"/api/*": {"origins": "*", "supports_credentials": True}})
 
-app.config['SECRET_KEY'] = os.getenv('SECRET_KEY')
+app.config['SECRET_KEY'] = os.getenv('SECRET_KEY', 'production-secret-key-change-in-production')
 app.config['JSON_SORT_KEYS'] = False
 app.config['SESSION_TYPE'] = 'filesystem'
 app.config['PERMANENT_SESSION_LIFETIME'] = timedelta(days=30)
@@ -62,7 +62,6 @@ def cache_with_expiry(expiry_seconds=300):
 WEATHER_CONDITION_MAP = {
     'Clear': {
         'playlist': 'happy pop upbeat',
-        'playlist_ids': ['37i9dQZF1DXdPec7aLTmlC'],
         'sound': 'https://cdn.pixabay.com/audio/2022/03/22/audio_1e5d97d57a.mp3',
         'activities': ['Hiking', 'Picnic', 'Beach visit', 'Outdoor photography', 'Cycling', 'Running', 'Gardening', 'BBQ'],
         'mood': 'energetic',
@@ -73,7 +72,6 @@ WEATHER_CONDITION_MAP = {
     },
     'Clouds': {
         'playlist': 'chill vibes relaxing',
-        'playlist_ids': ['37i9dQZF1DX4WYpdgoIcn6'],
         'sound': 'https://cdn.pixabay.com/audio/2021/08/09/audio_0625c1539c.mp3',
         'activities': ['Museum visit', 'Shopping', 'Outdoor walk', 'Coffee shop', 'Reading', 'Urban exploration'],
         'mood': 'relaxed',
@@ -84,7 +82,6 @@ WEATHER_CONDITION_MAP = {
     },
     'Rain': {
         'playlist': 'rainy day jazz',
-        'playlist_ids': ['37i9dQZF1DWXe9gFZP0gtP'],
         'sound': 'https://cdn.pixabay.com/audio/2022/03/10/audio_c9054832ff.mp3',
         'activities': ['Movie marathon', 'Reading', 'Indoor cafe', 'Cooking', 'Art & crafts', 'Board games', 'Journaling'],
         'mood': 'cozy',
@@ -95,7 +92,6 @@ WEATHER_CONDITION_MAP = {
     },
     'Drizzle': {
         'playlist': 'peaceful piano',
-        'playlist_ids': ['37i9dQZF1DX4PP3DA4J0N8'],
         'sound': 'https://cdn.pixabay.com/audio/2022/03/10/audio_d0d5b89a6c.mp3',
         'activities': ['Umbrella walk', 'Photography', 'Bookstore visit', 'Tea time', 'Journaling', 'Meditation'],
         'mood': 'contemplative',
@@ -106,7 +102,6 @@ WEATHER_CONDITION_MAP = {
     },
     'Thunderstorm': {
         'playlist': 'epic cinematic',
-        'playlist_ids': ['37i9dQZF1DX4sWSpwq3LiO'],
         'sound': 'https://cdn.pixabay.com/audio/2021/08/04/audio_12b0c7443c.mp3',
         'activities': ['Stay indoors', 'Board games', 'Movie watching', 'Baking', 'Reading', 'Puzzle solving'],
         'mood': 'intense',
@@ -117,7 +112,6 @@ WEATHER_CONDITION_MAP = {
     },
     'Snow': {
         'playlist': 'winter acoustic',
-        'playlist_ids': ['37i9dQZF1DX4E3UdUs7fUx'],
         'sound': 'https://cdn.pixabay.com/audio/2022/01/18/audio_12b2c26c8c.mp3',
         'activities': ['Build snowman', 'Hot chocolate', 'Winter photography', 'Sledding', 'Ice skating', 'Skiing'],
         'mood': 'peaceful',
@@ -128,7 +122,6 @@ WEATHER_CONDITION_MAP = {
     },
     'Mist': {
         'playlist': 'ambient soundscapes',
-        'playlist_ids': ['37i9dQZF1DX3Ogo9pFvBkY'],
         'sound': 'https://cdn.pixabay.com/audio/2021/10/07/audio_bb630cc098.mp3',
         'activities': ['Meditation', 'Yoga', 'Gentle walk', 'Spa day', 'Relaxation', 'Mindfulness'],
         'mood': 'mysterious',
@@ -139,7 +132,6 @@ WEATHER_CONDITION_MAP = {
     },
     'Fog': {
         'playlist': 'calm meditation',
-        'playlist_ids': ['37i9dQZF1DWZd79rJ6a7lp'],
         'sound': 'https://cdn.pixabay.com/audio/2021/10/07/audio_bb630cc098.mp3',
         'activities': ['Indoor activities', 'Reading', 'Puzzle solving', 'Tea ceremony', 'Creative writing'],
         'mood': 'calm',
@@ -150,7 +142,6 @@ WEATHER_CONDITION_MAP = {
     },
     'Haze': {
         'playlist': 'indie folk',
-        'playlist_ids': ['37i9dQZF1DX2sUQwD7tbmL'],
         'sound': 'https://cdn.pixabay.com/audio/2021/08/09/audio_0625c1539c.mp3',
         'activities': ['Indoor photography', 'Creative writing', 'Music listening', 'Painting', 'Creative projects'],
         'mood': 'dreamy',
@@ -161,7 +152,6 @@ WEATHER_CONDITION_MAP = {
     },
     'Smoke': {
         'playlist': 'deep focus',
-        'playlist_ids': ['37i9dQZF1DWZeKCadgRdKQ'],
         'sound': 'https://cdn.pixabay.com/audio/2021/10/07/audio_bb630cc098.mp3',
         'activities': ['Stay indoors', 'Air purification', 'Indoor exercise', 'Work from home', 'Rest'],
         'mood': 'focused',
@@ -170,28 +160,6 @@ WEATHER_CONDITION_MAP = {
         'clothing': ['N95 mask', 'Stay indoors', 'Protective gear'],
         'health_tips': ['Stay indoors', 'Use air purifiers', 'Wear N95 masks if going out', 'Monitor air quality']
     },
-    'Dust': {
-        'playlist': 'atmospheric ambient',
-        'playlist_ids': ['37i9dQZF1DWZd79rJ6a7lp'],
-        'sound': 'https://cdn.pixabay.com/audio/2021/08/09/audio_0625c1539c.mp3',
-        'activities': ['Indoor activities', 'Museums', 'Indoor sports', 'Movie theaters'],
-        'mood': 'cautious',
-        'color_palette': ['#D2B48C', '#DEB887', '#F5DEB3', '#FFE4C4'],
-        'emoji': '🌪️',
-        'clothing': ['Mask', 'Eye protection', 'Cover exposed skin'],
-        'health_tips': ['Wear protective masks', 'Seal windows', 'Use air purifiers', 'Stay hydrated']
-    },
-    'Tornado': {
-        'playlist': 'intense classical',
-        'playlist_ids': ['37i9dQZF1DX4sWSpwq3LiO'],
-        'sound': 'https://cdn.pixabay.com/audio/2021/08/04/audio_12b0c7443c.mp3',
-        'activities': ['Seek shelter immediately', 'Emergency preparedness', 'Safety first'],
-        'mood': 'urgent',
-        'color_palette': ['#000000', '#2F4F4F', '#696969', '#8B0000'],
-        'emoji': '🌪️',
-        'clothing': ['Protective gear', 'Emergency supplies'],
-        'health_tips': ['Seek shelter immediately', 'Stay in basement/interior room', 'Monitor emergency broadcasts']
-    }
 }
 
 WEATHER_FUN_FACTS = [
@@ -205,16 +173,6 @@ WEATHER_FUN_FACTS = [
     "Clouds appear white because they reflect sunlight from above in all directions",
     "Modern weather forecasting has a 5-day accuracy rate of approximately 90%",
     "Rainbows are actually full circles, but we typically see only half from ground level",
-    "Fog is essentially a cloud that has formed at ground level",
-    "There are over 2,000 thunderstorms occurring on Earth at any given moment",
-    "The coldest temperature ever recorded was -128.6°F (-89.2°C) at Vostok Station, Antarctica",
-    "A single cumulus cloud can weigh more than 1 million pounds due to water content",
-    "Weather satellites orbit Earth at speeds of about 17,000 mph",
-    "The hottest place on Earth is the Lut Desert in Iran, reaching 159.3°F",
-    "A hurricane releases energy equivalent to 10,000 nuclear bombs",
-    "The wettest place on Earth is Mawsynram, India, receiving 467 inches of rain annually",
-    "Snowflakes always have six sides due to the molecular structure of ice crystals",
-    "The largest hailstone ever recorded was 8 inches in diameter and weighed nearly 2 pounds",
 ]
 
 GLOBAL_CITIES = [
@@ -222,8 +180,6 @@ GLOBAL_CITIES = [
     'Dubai,AE', 'Singapore,SG', 'Mumbai,IN', 'Toronto,CA', 'Berlin,DE',
     'Rome,IT', 'Barcelona,ES', 'Rio de Janeiro,BR', 'Cairo,EG', 'Bangkok,TH',
     'Istanbul,TR', 'Seoul,KR', 'Mexico City,MX', 'Moscow,RU', 'Los Angeles,US',
-    'Amsterdam,NL', 'Vienna,AT', 'Prague,CZ', 'Buenos Aires,AR', 'Cape Town,ZA',
-    'Beijing,CN', 'Hong Kong,HK', 'Lisbon,PT', 'Dublin,IE', 'Copenhagen,DK',
 ]
 
 def get_moon_phase():
@@ -290,68 +246,148 @@ def get_spotify_token():
         logger.error(f"Spotify authentication failed: {e}")
         return None
 
-@cache_with_expiry(expiry_seconds=300)
-def get_location_from_ip(ip_address=None):
-    try:
-        if not ip_address or ip_address == '127.0.0.1' or ip_address.startswith('192.168'):
-            ip_address = None
-        
-        if IPGEOLOCATION_API_KEY:
-            url = f"https://api.ipgeolocation.io/ipgeo?apiKey={IPGEOLOCATION_API_KEY}"
-            if ip_address:
-                url += f"&ip={ip_address}"
-            response = requests.get(url, timeout=5)
-            data = response.json()
-            
-            lat = float(data.get('latitude', 0))
-            lon = float(data.get('longitude', 0))
-            
-            if lat == 0 and lon == 0:
-                raise ValueError("Invalid coordinates")
-            
-            return {
-                'city': data.get('city', 'Unknown'),
-                'country': data.get('country_name', 'Unknown'),
-                'lat': lat,
-                'lon': lon,
-                'timezone': data.get('time_zone', {}).get('name', 'UTC') if isinstance(data.get('time_zone'), dict) else 'UTC',
-                'state': data.get('state_prov', ''),
-                'zipcode': data.get('zipcode', '')
-            }
-        else:
-            url = f"http://ip-api.com/json/{ip_address}?fields=status,message,country,countryCode,region,regionName,city,zip,lat,lon,timezone" if ip_address else "http://ip-api.com/json/?fields=status,message,country,countryCode,region,regionName,city,zip,lat,lon,timezone"
-            response = requests.get(url, timeout=5)
-            data = response.json()
-            
-            if data.get('status') == 'fail':
-                raise ValueError(data.get('message', 'Geolocation failed'))
-            
-            lat = data.get('lat', 0)
-            lon = data.get('lon', 0)
-            
-            if lat == 0 and lon == 0:
-                raise ValueError("Invalid coordinates")
-            
-            return {
-                'city': data.get('city', 'Unknown'),
-                'country': data.get('country', 'Unknown'),
-                'lat': lat,
-                'lon': lon,
-                'timezone': data.get('timezone', 'UTC'),
-                'state': data.get('regionName', ''),
-                'zipcode': data.get('zip', '')
-            }
-    except Exception as e:
-        logger.error(f"IP geolocation failed: {e}")
-        return {
-            'city': 'London',
-            'country': 'United Kingdom',
-            'lat': 51.5074,
-            'lon': -0.1278,
-            'timezone': 'Europe/London',
-            'state': 'England',
-            'zipcode': ''
-        }
+def get_location_from_ip_multiple_services(ip_address=None):
+    """Try multiple geolocation services for better accuracy"""
+    
+    if not ip_address or ip_address == '127.0.0.1' or ip_address.startswith('192.168') or ip_address.startswith('10.'):
+        ip_address = None
+    
+    services = []
+    
+    if IPGEOLOCATION_API_KEY:
+        services.append(('ipgeolocation', lambda: get_ipgeolocation_api(ip_address)))
+    
+    services.extend([
+        ('ip-api', lambda: get_ip_api(ip_address)),
+        ('ipapi', lambda: get_ipapi_co(ip_address)),
+        ('ipwhois', lambda: get_ipwhois(ip_address))
+    ])
+    
+    for service_name, service_func in services:
+        try:
+            logger.info(f"Trying {service_name} for IP: {ip_address or 'auto'}")
+            result = service_func()
+            if result and result.get('lat') != 0 and result.get('lon') != 0:
+                logger.info(f"Successfully got location from {service_name}: {result.get('city')}, {result.get('country')}")
+                return result
+        except Exception as e:
+            logger.warning(f"{service_name} failed: {e}")
+            continue
+    
+    logger.warning("All geolocation services failed, using default location")
+    return {
+        'city': 'London',
+        'country': 'United Kingdom',
+        'lat': 51.5074,
+        'lon': -0.1278,
+        'timezone': 'Europe/London',
+        'state': 'England',
+        'zipcode': '',
+        'source': 'default'
+    }
+
+def get_ipgeolocation_api(ip_address):
+    url = f"https://api.ipgeolocation.io/ipgeo?apiKey={IPGEOLOCATION_API_KEY}"
+    if ip_address:
+        url += f"&ip={ip_address}"
+    
+    response = requests.get(url, timeout=5)
+    data = response.json()
+    
+    lat = float(data.get('latitude', 0))
+    lon = float(data.get('longitude', 0))
+    
+    if lat == 0 and lon == 0:
+        raise ValueError("Invalid coordinates from ipgeolocation.io")
+    
+    return {
+        'city': data.get('city', 'Unknown'),
+        'country': data.get('country_name', 'Unknown'),
+        'lat': lat,
+        'lon': lon,
+        'timezone': data.get('time_zone', {}).get('name', 'UTC') if isinstance(data.get('time_zone'), dict) else 'UTC',
+        'state': data.get('state_prov', ''),
+        'zipcode': data.get('zipcode', ''),
+        'source': 'ipgeolocation.io'
+    }
+
+def get_ip_api(ip_address):
+    url = f"http://ip-api.com/json/{ip_address}?fields=status,message,country,countryCode,region,regionName,city,zip,lat,lon,timezone,isp" if ip_address else "http://ip-api.com/json/?fields=status,message,country,countryCode,region,regionName,city,zip,lat,lon,timezone,isp"
+    
+    response = requests.get(url, timeout=5)
+    data = response.json()
+    
+    if data.get('status') == 'fail':
+        raise ValueError(data.get('message', 'ip-api.com failed'))
+    
+    lat = float(data.get('lat', 0))
+    lon = float(data.get('lon', 0))
+    
+    if lat == 0 and lon == 0:
+        raise ValueError("Invalid coordinates from ip-api.com")
+    
+    return {
+        'city': data.get('city', 'Unknown'),
+        'country': data.get('country', 'Unknown'),
+        'lat': lat,
+        'lon': lon,
+        'timezone': data.get('timezone', 'UTC'),
+        'state': data.get('regionName', ''),
+        'zipcode': data.get('zip', ''),
+        'source': 'ip-api.com'
+    }
+
+def get_ipapi_co(ip_address):
+    url = f"https://ipapi.co/{ip_address}/json/" if ip_address else "https://ipapi.co/json/"
+    
+    response = requests.get(url, timeout=5)
+    data = response.json()
+    
+    if 'error' in data:
+        raise ValueError(data.get('reason', 'ipapi.co failed'))
+    
+    lat = float(data.get('latitude', 0))
+    lon = float(data.get('longitude', 0))
+    
+    if lat == 0 and lon == 0:
+        raise ValueError("Invalid coordinates from ipapi.co")
+    
+    return {
+        'city': data.get('city', 'Unknown'),
+        'country': data.get('country_name', 'Unknown'),
+        'lat': lat,
+        'lon': lon,
+        'timezone': data.get('timezone', 'UTC'),
+        'state': data.get('region', ''),
+        'zipcode': data.get('postal', ''),
+        'source': 'ipapi.co'
+    }
+
+def get_ipwhois(ip_address):
+    url = f"https://ipwho.is/{ip_address}" if ip_address else "https://ipwho.is/"
+    
+    response = requests.get(url, timeout=5)
+    data = response.json()
+    
+    if not data.get('success', False):
+        raise ValueError("ipwho.is failed")
+    
+    lat = float(data.get('latitude', 0))
+    lon = float(data.get('longitude', 0))
+    
+    if lat == 0 and lon == 0:
+        raise ValueError("Invalid coordinates from ipwho.is")
+    
+    return {
+        'city': data.get('city', 'Unknown'),
+        'country': data.get('country', 'Unknown'),
+        'lat': lat,
+        'lon': lon,
+        'timezone': data.get('timezone', {}).get('id', 'UTC') if isinstance(data.get('timezone'), dict) else 'UTC',
+        'state': data.get('region', ''),
+        'zipcode': data.get('postal', ''),
+        'source': 'ipwho.is'
+    }
 
 def get_greeting(timezone='UTC'):
     try:
@@ -507,7 +543,8 @@ def home():
         'documentation': '/api/docs',
         'endpoints': {
             'health': '/health',
-            'location': '/api/location/auto',
+            'location_ip': '/api/location/auto',
+            'location_coords': '/api/location/coords',
             'weather': '/api/weather/current',
             'forecast': '/api/weather/forecast',
             'explore': '/api/weather/explore'
@@ -518,10 +555,9 @@ def home():
 def health_check():
     return jsonify({
         'status': 'healthy',
-        'service': 'Weather Visualizer API Pro',
+        'service': 'SkyVibe Weather API Pro',
         'version': '2.0.0',
-        'timestamp': datetime.utcnow().isoformat(),
-        'features': ['Weather', 'Forecast', 'Air Quality', 'UV Index', 'Spotify', 'Moon Phase', 'Activities']
+        'timestamp': datetime.utcnow().isoformat()
     }), 200
 
 @app.route('/api/location/auto', methods=['GET'])
@@ -531,9 +567,8 @@ def auto_detect_location():
     if ip_address:
         ip_address = ip_address.split(',')[0].strip()
     
-    location = get_location_from_ip(ip_address)
+    location = get_location_from_ip_multiple_services(ip_address)
     greeting = get_greeting(location.get('timezone', 'UTC'))
-    
     moon = get_moon_phase()
     
     return jsonify({
@@ -543,6 +578,50 @@ def auto_detect_location():
         'moon_phase': moon,
         'timestamp': datetime.utcnow().isoformat()
     }), 200
+
+@app.route('/api/location/coords', methods=['POST'])
+@limiter.limit("100 per hour")
+def get_location_by_coords():
+    """Get location details from browser geolocation coordinates"""
+    data = request.get_json()
+    
+    if not data or 'lat' not in data or 'lon' not in data:
+        return jsonify({'error': 'Missing coordinates', 'success': False}), 400
+    
+    lat = float(data['lat'])
+    lon = float(data['lon'])
+    
+    try:
+        url = f"https://api.openweathermap.org/data/2.5/weather?lat={lat}&lon={lon}&appid={OPENWEATHER_API_KEY}"
+        response = requests.get(url, timeout=10)
+        response.raise_for_status()
+        weather_data = response.json()
+        
+        location = {
+            'city': weather_data.get('name', 'Unknown'),
+            'country': weather_data['sys'].get('country', 'Unknown'),
+            'lat': lat,
+            'lon': lon,
+            'timezone': weather_data.get('timezone', 0),
+            'state': '',
+            'zipcode': '',
+            'source': 'browser-geolocation'
+        }
+        
+        greeting = get_greeting()
+        moon = get_moon_phase()
+        
+        return jsonify({
+            'success': True,
+            'location': location,
+            'greeting': greeting,
+            'moon_phase': moon,
+            'timestamp': datetime.utcnow().isoformat()
+        }), 200
+        
+    except Exception as e:
+        logger.error(f"Location from coords failed: {e}")
+        return jsonify({'error': 'Failed to get location details', 'success': False}), 500
 
 @app.route('/api/weather/current', methods=['GET'])
 @limiter.limit("150 per hour")
@@ -559,7 +638,7 @@ def get_current_weather():
         ip_address = request.headers.get('X-Forwarded-For', request.remote_addr)
         if ip_address:
             ip_address = ip_address.split(',')[0].strip()
-        location = get_location_from_ip(ip_address)
+        location = get_location_from_ip_multiple_services(ip_address)
         lat, lon = location['lat'], location['lon']
     
     if lat and lon:
@@ -658,7 +737,7 @@ def get_forecast():
         ip_address = request.headers.get('X-Forwarded-For', request.remote_addr)
         if ip_address:
             ip_address = ip_address.split(',')[0].strip()
-        location = get_location_from_ip(ip_address)
+        location = get_location_from_ip_multiple_services(ip_address)
         lat, lon = location['lat'], location['lon']
     
     if city and not (lat and lon):
@@ -785,7 +864,7 @@ def get_weather_alerts():
         ip_address = request.headers.get('X-Forwarded-For', request.remote_addr)
         if ip_address:
             ip_address = ip_address.split(',')[0].strip()
-        location = get_location_from_ip(ip_address)
+        location = get_location_from_ip_multiple_services(ip_address)
         lat, lon = location['lat'], location['lon']
     
     try:
@@ -936,13 +1015,9 @@ def get_activity_suggestions():
     
     if temp:
         if temp > 30:
-            activities.extend(['Swimming', 'Water park', 'Indoor AC activities', 'Ice cream hunt', 'Beach volleyball'])
-        elif temp > 25:
-            activities.extend(['Outdoor sports', 'Park picnic', 'Cycling'])
+            activities.extend(['Swimming', 'Water park', 'Indoor AC activities'])
         elif temp < 5:
-            activities.extend(['Indoor activities', 'Hot beverages', 'Cozy indoor time', 'Winter sports'])
-        elif temp < 15:
-            activities.extend(['Brisk walk', 'Layered outdoor activities'])
+            activities.extend(['Indoor activities', 'Hot beverages', 'Cozy time'])
     
     activities = list(set(activities))
     suggested = random.sample(activities, min(5, len(activities)))
@@ -1041,112 +1116,12 @@ def get_ambient_sounds():
         'emoji': weather_config['emoji']
     }), 200
 
-@app.route('/api/analytics/summary', methods=['GET'])
-@limiter.limit("30 per hour")
-def get_weather_summary():
-    lat = request.args.get('lat', type=float)
-    lon = request.args.get('lon', type=float)
-    units = request.args.get('units', 'metric')
-    
-    if not lat or not lon:
-        ip_address = request.headers.get('X-Forwarded-For', request.remote_addr)
-        if ip_address:
-            ip_address = ip_address.split(',')[0].strip()
-        location = get_location_from_ip(ip_address)
-        lat, lon = location['lat'], location['lon']
-    
-    try:
-        current_url = f"https://api.openweathermap.org/data/2.5/weather?lat={lat}&lon={lon}&units={units}&appid={OPENWEATHER_API_KEY}"
-        current_response = requests.get(current_url, timeout=10)
-        current_data = current_response.json()
-        
-        forecast_url = f"https://api.openweathermap.org/data/2.5/forecast?lat={lat}&lon={lon}&units={units}&appid={OPENWEATHER_API_KEY}"
-        forecast_response = requests.get(forecast_url, timeout=10)
-        forecast_data = forecast_response.json()
-        
-        weather_main = current_data['weather'][0]['main']
-        weather_config = WEATHER_CONDITION_MAP.get(weather_main, WEATHER_CONDITION_MAP['Clear'])
-        
-        upcoming_temps = [item['main']['temp'] for item in forecast_data['list'][:8]]
-        upcoming_conditions = [item['weather'][0]['main'] for item in forecast_data['list'][:8]]
-        
-        uv_index = calculate_uv_index(lat, lon)
-        air_quality = get_air_quality(lat, lon)
-        moon = get_moon_phase()
-        
-        summary = {
-            'success': True,
-            'location': {
-                'name': current_data.get('name', 'Unknown'),
-                'country': current_data['sys'].get('country', 'Unknown')
-            },
-            'current': {
-                'temperature': round(current_data['main']['temp'], 1),
-                'condition': weather_main,
-                'description': current_data['weather'][0]['description'].title(),
-                'emoji': weather_config['emoji']
-            },
-            'today_forecast': {
-                'high': round(max(upcoming_temps), 1),
-                'low': round(min(upcoming_temps), 1),
-                'avg': round(sum(upcoming_temps) / len(upcoming_temps), 1)
-            },
-            'insights': {
-                'mood': weather_config['mood'],
-                'activity': random.choice(weather_config['activities']),
-                'fun_fact': random.choice(WEATHER_FUN_FACTS),
-                'color_palette': weather_config['color_palette']
-            },
-            'health': {
-                'uv_index': uv_index,
-                'air_quality': air_quality,
-                'clothing': weather_config['clothing'],
-                'tips': weather_config['health_tips']
-            },
-            'astronomy': {
-                'moon_phase': moon,
-                'sunrise': datetime.fromtimestamp(current_data['sys']['sunrise']).strftime('%I:%M %p'),
-                'sunset': datetime.fromtimestamp(current_data['sys']['sunset']).strftime('%I:%M %p')
-            },
-            'upcoming_changes': len(set(upcoming_conditions)) > 1,
-            'weather_score': calculate_weather_score({
-                'temperature': {'current': current_data['main']['temp']},
-                'details': {
-                    'humidity': current_data['main']['humidity'],
-                    'wind': {'speed': current_data['wind']['speed']}
-                },
-                'weather': {'main': weather_main}
-            }),
-            'timestamp': datetime.utcnow().isoformat()
-        }
-        
-        return jsonify(summary), 200
-        
-    except Exception as e:
-        logger.error(f"Summary generation failed: {e}")
-        return jsonify({'error': 'Summary unavailable', 'success': False}), 503
-
 @app.errorhandler(404)
 def not_found(error):
     return jsonify({
         'success': False,
         'error': 'Endpoint not found',
-        'code': 404,
-        'available_endpoints': [
-            '/',
-            '/health',
-            '/api/location/auto',
-            '/api/weather/current',
-            '/api/weather/forecast',
-            '/api/weather/alerts',
-            '/api/weather/explore',
-            '/api/weather/compare',
-            '/api/insights/fun-fact',
-            '/api/insights/activities',
-            '/api/entertainment/spotify',
-            '/api/entertainment/sounds',
-            '/api/analytics/summary'
-        ]
+        'code': 404
     }), 404
 
 @app.errorhandler(500)
@@ -1161,7 +1136,7 @@ def internal_error(error):
 def ratelimit_handler(e):
     return jsonify({
         'success': False,
-        'error': 'Rate limit exceeded. Please try again later.',
+        'error': 'Rate limit exceeded',
         'code': 429
     }), 429
 

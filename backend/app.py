@@ -3,23 +3,28 @@ import requests
 import random
 import logging
 from datetime import datetime, timedelta
-from functools import lru_cache
-from flask import Flask, request, jsonify
+from functools import lru_cache, wraps
+from flask import Flask, request, jsonify, session
 from flask_cors import CORS
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
+from collections import defaultdict
 import base64
+import hashlib
+import time
 
 app = Flask(__name__)
-CORS(app, resources={r"/api/*": {"origins": "*"}})
+CORS(app, resources={r"/api/*": {"origins": "*", "supports_credentials": True}})
 
-app.config['SECRET_KEY'] = os.getenv('SECRET_KEY', 'dev-7f4d8e3a9b2c5f1e6d0a8c7b4e2f9d3a5c8b1e4d7a0f3e6c9b2d5a8f1c4e7ba8f7e3d9c2b5a1e6f0d8c7b4e2f9d3a5c8b1e4d7a0f3e6c9b2d5a8f1c4e7b0d3a9')
+app.config['SECRET_KEY'] = os.getenv('SECRET_KEY')
 app.config['JSON_SORT_KEYS'] = False
+app.config['SESSION_TYPE'] = 'filesystem'
+app.config['PERMANENT_SESSION_LIFETIME'] = timedelta(days=30)
 
 limiter = Limiter(
     app=app,
     key_func=get_remote_address,
-    default_limits=["300 per day", "100 per hour"],
+    default_limits=["500 per day", "150 per hour"],
     storage_uri="memory://"
 )
 
@@ -29,71 +34,163 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-OPENWEATHER_API_KEY = os.getenv('OPENWEATHER_API_KEY','e597f0454b011ac1ad8a410141ca2ff6')
-SPOTIFY_CLIENT_ID = os.getenv('SPOTIFY_CLIENT_ID','eb71667657e542caaeb0d3c7a57c5026')
-SPOTIFY_CLIENT_SECRET = os.getenv('SPOTIFY_CLIENT_SECRET','f313d98a2db6429297534ed4611f4085')
-IPGEOLOCATION_API_KEY = os.getenv('IPGEOLOCATION_API_KEY', '292343e8-01b1-4bc6-9f54-82efda06f81e')
+OPENWEATHER_API_KEY = os.getenv('OPENWEATHER_API_KEY')
+SPOTIFY_CLIENT_ID = os.getenv('SPOTIFY_CLIENT_ID')
+SPOTIFY_CLIENT_SECRET = os.getenv('SPOTIFY_CLIENT_SECRET')
+IPGEOLOCATION_API_KEY = os.getenv('IPGEOLOCATION_API_KEY', '')
+
+cache_store = {}
+
+def cache_with_expiry(expiry_seconds=300):
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            cache_key = f"{func.__name__}:{str(args)}:{str(kwargs)}"
+            cache_hash = hashlib.md5(cache_key.encode()).hexdigest()
+            
+            if cache_hash in cache_store:
+                cached_data, timestamp = cache_store[cache_hash]
+                if time.time() - timestamp < expiry_seconds:
+                    return cached_data
+            
+            result = func(*args, **kwargs)
+            cache_store[cache_hash] = (result, time.time())
+            return result
+        return wrapper
+    return decorator
 
 WEATHER_CONDITION_MAP = {
     'Clear': {
-        'playlist': 'Happy Vibes',
-        'sound': 'https://cdn.pixabay.com/audio/2022/03/birds-chirping.mp3',
-        'activities': ['Hiking', 'Picnic', 'Beach visit', 'Outdoor photography', 'Cycling', 'Running'],
-        'mood': 'energetic'
+        'playlist': 'sunny happy vibes upbeat',
+        'playlist_ids': ['37i9dQZF1DXdPec7aLTmlC', '37i9dQZF1DX0UrRvztWcAU'],
+        'sound': 'https://cdn.pixabay.com/audio/2022/03/22/audio_1e5d97d57a.mp3',
+        'activities': ['Hiking', 'Picnic', 'Beach visit', 'Outdoor photography', 'Cycling', 'Running', 'Gardening', 'BBQ'],
+        'mood': 'energetic',
+        'color_palette': ['#FFD700', '#FFA500', '#87CEEB', '#00BFFF'],
+        'emoji': '☀️',
+        'clothing': ['Sunglasses', 'Light clothing', 'Sunscreen', 'Hat', 'Shorts'],
+        'health_tips': ['Stay hydrated', 'Use SPF 30+ sunscreen', 'Avoid peak sun hours (10am-4pm)']
     },
     'Clouds': {
-        'playlist': 'Chill Lounge',
-        'sound': 'https://cdn.pixabay.com/audio/2021/08/wind-gentle.mp3',
-        'activities': ['Museum visit', 'Shopping', 'Outdoor walk', 'Coffee shop', 'Reading'],
-        'mood': 'relaxed'
+        'playlist': 'chill lounge relaxing ambient',
+        'playlist_ids': ['37i9dQZF1DX4WYpdgoIcn6', '37i9dQZF1DWTwnEm1IYyoj'],
+        'sound': 'https://cdn.pixabay.com/audio/2021/08/09/audio_0625c1539c.mp3',
+        'activities': ['Museum visit', 'Shopping', 'Outdoor walk', 'Coffee shop', 'Reading', 'Urban exploration'],
+        'mood': 'relaxed',
+        'color_palette': ['#808080', '#A9A9A9', '#D3D3D3', '#778899'],
+        'emoji': '☁️',
+        'clothing': ['Light jacket', 'Comfortable shoes', 'Layers'],
+        'health_tips': ['Perfect weather for outdoor activities', 'Good time for vitamin D', 'Stay active']
     },
     'Rain': {
-        'playlist': 'Lo-Fi Beats',
-        'sound': 'https://cdn.pixabay.com/audio/2022/03/rain-moderate.mp3',
-        'activities': ['Movie marathon', 'Reading', 'Indoor cafe', 'Cooking', 'Art & crafts', 'Board games'],
-        'mood': 'cozy'
+        'playlist': 'rainy day lofi jazz cozy',
+        'playlist_ids': ['37i9dQZF1DWXe9gFZP0gtP', '37i9dQZF1DX4PP3DA4J0N8'],
+        'sound': 'https://cdn.pixabay.com/audio/2022/03/10/audio_c9054832ff.mp3',
+        'activities': ['Movie marathon', 'Reading', 'Indoor cafe', 'Cooking', 'Art & crafts', 'Board games', 'Journaling'],
+        'mood': 'cozy',
+        'color_palette': ['#4682B4', '#5F9EA0', '#708090', '#2F4F4F'],
+        'emoji': '🌧️',
+        'clothing': ['Umbrella', 'Raincoat', 'Waterproof shoes', 'Rain boots'],
+        'health_tips': ['Boost immune system', 'Stay warm and dry', 'Hot beverages recommended']
     },
     'Drizzle': {
-        'playlist': 'Rainy Day Jazz',
-        'sound': 'https://cdn.pixabay.com/audio/2022/03/rain-light.mp3',
-        'activities': ['Umbrella walk', 'Photography', 'Bookstore visit', 'Tea time', 'Journaling'],
-        'mood': 'contemplative'
+        'playlist': 'rainy day jazz peaceful',
+        'playlist_ids': ['37i9dQZF1DX4PP3DA4J0N8', '37i9dQZF1DX0SM0LYsmbMT'],
+        'sound': 'https://cdn.pixabay.com/audio/2022/03/10/audio_d0d5b89a6c.mp3',
+        'activities': ['Umbrella walk', 'Photography', 'Bookstore visit', 'Tea time', 'Journaling', 'Meditation'],
+        'mood': 'contemplative',
+        'color_palette': ['#B0C4DE', '#ADD8E6', '#87CEEB', '#6495ED'],
+        'emoji': '🌦️',
+        'clothing': ['Light rain jacket', 'Umbrella', 'Comfortable shoes'],
+        'health_tips': ['Perfect for contemplation', 'Stay moderately active', 'Enjoy the calm']
     },
     'Thunderstorm': {
-        'playlist': 'Epic Cinematic',
-        'sound': 'https://cdn.pixabay.com/audio/2021/08/thunder-storm.mp3',
-        'activities': ['Stay indoors', 'Board games', 'Movie watching', 'Baking', 'Reading'],
-        'mood': 'intense'
+        'playlist': 'epic cinematic dramatic intense',
+        'playlist_ids': ['37i9dQZF1DX4sWSpwq3LiO', '37i9dQZF1DX3Ogo9pFvBkY'],
+        'sound': 'https://cdn.pixabay.com/audio/2021/08/04/audio_12b0c7443c.mp3',
+        'activities': ['Stay indoors', 'Board games', 'Movie watching', 'Baking', 'Reading', 'Puzzle solving'],
+        'mood': 'intense',
+        'color_palette': ['#2F4F4F', '#36454F', '#343434', '#800080'],
+        'emoji': '⛈️',
+        'clothing': ['Stay indoors', 'Emergency kit ready'],
+        'health_tips': ['Stay indoors', 'Avoid electrical devices', 'Keep emergency supplies ready']
     },
     'Snow': {
-        'playlist': 'Cozy Winter',
-        'sound': 'https://cdn.pixabay.com/audio/2022/01/fireplace-crackling.mp3',
-        'activities': ['Build snowman', 'Hot chocolate', 'Winter photography', 'Sledding', 'Ice skating'],
-        'mood': 'peaceful'
+        'playlist': 'cozy winter christmas acoustic',
+        'playlist_ids': ['37i9dQZF1DX4E3UdUs7fUx', '37i9dQZF1DX0Yxoavh5qJV'],
+        'sound': 'https://cdn.pixabay.com/audio/2022/01/18/audio_12b2c26c8c.mp3',
+        'activities': ['Build snowman', 'Hot chocolate', 'Winter photography', 'Sledding', 'Ice skating', 'Skiing'],
+        'mood': 'peaceful',
+        'color_palette': ['#FFFFFF', '#F0F8FF', '#E0FFFF', '#B0E0E6'],
+        'emoji': '❄️',
+        'clothing': ['Heavy coat', 'Gloves', 'Scarf', 'Winter boots', 'Thermal layers'],
+        'health_tips': ['Layer up', 'Protect extremities', 'Stay warm and dry', 'Watch for ice']
     },
     'Mist': {
-        'playlist': 'Ambient Soundscapes',
-        'sound': 'https://cdn.pixabay.com/audio/2021/10/forest-ambience.mp3',
-        'activities': ['Meditation', 'Yoga', 'Gentle walk', 'Spa day', 'Relaxation'],
-        'mood': 'mysterious'
+        'playlist': 'ambient soundscapes ethereal',
+        'playlist_ids': ['37i9dQZF1DX3Ogo9pFvBkY', '37i9dQZF1DX4PP3DA4J0N8'],
+        'sound': 'https://cdn.pixabay.com/audio/2021/10/07/audio_bb630cc098.mp3',
+        'activities': ['Meditation', 'Yoga', 'Gentle walk', 'Spa day', 'Relaxation', 'Mindfulness'],
+        'mood': 'mysterious',
+        'color_palette': ['#F5F5F5', '#DCDCDC', '#C0C0C0', '#A9A9A9'],
+        'emoji': '🌫️',
+        'clothing': ['Light layers', 'Visibility clothing', 'Comfortable shoes'],
+        'health_tips': ['Drive carefully', 'Use visibility aids', 'Stay aware of surroundings']
     },
     'Fog': {
-        'playlist': 'Mystery & Calm',
-        'sound': 'https://cdn.pixabay.com/audio/2021/10/ocean-waves.mp3',
-        'activities': ['Indoor activities', 'Reading', 'Puzzle solving', 'Tea ceremony'],
-        'mood': 'calm'
+        'playlist': 'mysterious calm ambient',
+        'playlist_ids': ['37i9dQZF1DX3Ogo9pFvBkY', '37i9dQZF1DWZd79rJ6a7lp'],
+        'sound': 'https://cdn.pixabay.com/audio/2021/10/07/audio_bb630cc098.mp3',
+        'activities': ['Indoor activities', 'Reading', 'Puzzle solving', 'Tea ceremony', 'Creative writing'],
+        'mood': 'calm',
+        'color_palette': ['#E5E4E2', '#BCC6CC', '#98AFC7', '#6D7B8D'],
+        'emoji': '🌫️',
+        'clothing': ['Layers', 'Reflective gear', 'Warm clothing'],
+        'health_tips': ['Reduce outdoor activities', 'Use air purifiers indoors', 'Stay hydrated']
     },
     'Haze': {
-        'playlist': 'Dreamy Indie',
-        'sound': 'https://cdn.pixabay.com/audio/2021/08/wind-gentle.mp3',
-        'activities': ['Indoor photography', 'Creative writing', 'Music listening', 'Painting'],
-        'mood': 'dreamy'
+        'playlist': 'dreamy indie alternative',
+        'playlist_ids': ['37i9dQZF1DX2sUQwD7tbmL', '37i9dQZF1DX3YSRoSdA634'],
+        'sound': 'https://cdn.pixabay.com/audio/2021/08/09/audio_0625c1539c.mp3',
+        'activities': ['Indoor photography', 'Creative writing', 'Music listening', 'Painting', 'Creative projects'],
+        'mood': 'dreamy',
+        'color_palette': ['#F0E68C', '#EEE8AA', '#FFE4B5', '#FFDAB9'],
+        'emoji': '🌫️',
+        'clothing': ['Mask recommended', 'Light layers', 'Eye protection'],
+        'health_tips': ['Limit outdoor exposure', 'Use air filters', 'Stay hydrated', 'Protect respiratory health']
     },
     'Smoke': {
-        'playlist': 'Deep Focus',
-        'sound': 'https://cdn.pixabay.com/audio/2021/10/forest-ambience.mp3',
-        'activities': ['Stay indoors', 'Air purification', 'Indoor exercise', 'Work from home'],
-        'mood': 'focused'
+        'playlist': 'deep focus concentration',
+        'playlist_ids': ['37i9dQZF1DWZeKCadgRdKQ', '37i9dQZF1DX3PFzdbtx1Us'],
+        'sound': 'https://cdn.pixabay.com/audio/2021/10/07/audio_bb630cc098.mp3',
+        'activities': ['Stay indoors', 'Air purification', 'Indoor exercise', 'Work from home', 'Rest'],
+        'mood': 'focused',
+        'color_palette': ['#696969', '#708090', '#778899', '#2F4F4F'],
+        'emoji': '💨',
+        'clothing': ['N95 mask', 'Stay indoors', 'Protective gear'],
+        'health_tips': ['Stay indoors', 'Use air purifiers', 'Wear N95 masks if going out', 'Monitor air quality']
+    },
+    'Dust': {
+        'playlist': 'desert blues atmospheric',
+        'playlist_ids': ['37i9dQZF1DWZd79rJ6a7lp', '37i9dQZF1DX3Ogo9pFvBkY'],
+        'sound': 'https://cdn.pixabay.com/audio/2021/08/09/audio_0625c1539c.mp3',
+        'activities': ['Indoor activities', 'Museums', 'Indoor sports', 'Movie theaters'],
+        'mood': 'cautious',
+        'color_palette': ['#D2B48C', '#DEB887', '#F5DEB3', '#FFE4C4'],
+        'emoji': '🌪️',
+        'clothing': ['Mask', 'Eye protection', 'Cover exposed skin'],
+        'health_tips': ['Wear protective masks', 'Seal windows', 'Use air purifiers', 'Stay hydrated']
+    },
+    'Tornado': {
+        'playlist': 'intense classical epic',
+        'playlist_ids': ['37i9dQZF1DX4sWSpwq3LiO', '37i9dQZF1DWZBCBq9YLx6e'],
+        'sound': 'https://cdn.pixabay.com/audio/2021/08/04/audio_12b0c7443c.mp3',
+        'activities': ['Seek shelter immediately', 'Emergency preparedness', 'Safety first'],
+        'mood': 'urgent',
+        'color_palette': ['#000000', '#2F4F4F', '#696969', '#8B0000'],
+        'emoji': '🌪️',
+        'clothing': ['Protective gear', 'Emergency supplies'],
+        'health_tips': ['Seek shelter immediately', 'Stay in basement/interior room', 'Monitor emergency broadcasts']
     }
 }
 
@@ -112,12 +209,22 @@ WEATHER_FUN_FACTS = [
     "There are over 2,000 thunderstorms occurring on Earth at any given moment",
     "The coldest temperature ever recorded was -128.6°F (-89.2°C) at Vostok Station, Antarctica",
     "A single cumulus cloud can weigh more than 1 million pounds due to water content",
-    "The fear of weather is called 'meteorophobia' and affects millions worldwide",
-    "Snowflakes can take up to an hour to fall from cloud to ground",
-    "The Earth's atmosphere weighs about 5.5 quadrillion tons",
-    "A hurricane releases energy equivalent to 10,000 nuclear bombs",
     "Weather satellites orbit Earth at speeds of about 17,000 mph",
-    "The hottest place on Earth is the Lut Desert in Iran, reaching 159.3°F"
+    "The hottest place on Earth is the Lut Desert in Iran, reaching 159.3°F",
+    "A single hurricane can release energy equivalent to 10,000 nuclear bombs",
+    "The wettest place on Earth is Mawsynram, India, receiving 467 inches of rain annually",
+    "Snowflakes always have six sides due to the molecular structure of ice crystals",
+    "The largest hailstone ever recorded was 8 inches in diameter and weighed nearly 2 pounds",
+    "Tornadoes can have wind speeds exceeding 300 mph",
+    "The eye of a hurricane is typically 20-40 miles wide and completely calm",
+    "Diamond dust is a type of precipitation that occurs when ice crystals fall from a clear sky",
+    "Ball lightning is a rare weather phenomenon that scientists still don't fully understand",
+    "The smell of rain is called 'petrichor' and is caused by oils released from plants and bacteria",
+    "Watermelon snow is a real phenomenon caused by algae that makes snow appear pink or red",
+    "A full rainbow is actually a complete circle, but ground observers only see the arc",
+    "Mammatus clouds look like pouches hanging from the sky and often appear before severe storms",
+    "The hottest temperature ever recorded in inhabited areas was 129.2°F in Kuwait in 2016",
+    "Virga is rain that evaporates before reaching the ground, creating curtain-like formations"
 ]
 
 GLOBAL_CITIES = [
@@ -126,12 +233,75 @@ GLOBAL_CITIES = [
     'Rome,IT', 'Barcelona,ES', 'Rio de Janeiro,BR', 'Cairo,EG', 'Bangkok,TH',
     'Istanbul,TR', 'Seoul,KR', 'Mexico City,MX', 'Moscow,RU', 'Los Angeles,US',
     'Amsterdam,NL', 'Vienna,AT', 'Prague,CZ', 'Buenos Aires,AR', 'Cape Town,ZA',
-    'Beijing,CN', 'Hong Kong,HK', 'Lisbon,PT', 'Dublin,IE', 'Copenhagen,DK'
+    'Beijing,CN', 'Hong Kong,HK', 'Lisbon,PT', 'Dublin,IE', 'Copenhagen,DK',
+    'Stockholm,SE', 'Oslo,NO', 'Helsinki,FI', 'Athens,GR', 'Zurich,CH',
+    'Brussels,BE', 'Warsaw,PL', 'Budapest,HU', 'Kuala Lumpur,MY', 'Jakarta,ID',
+    'Manila,PH', 'Hanoi,VN', 'Tehran,IR', 'Baghdad,IQ', 'Riyadh,SA',
+    'Lima,PE', 'Bogota,CO', 'Santiago,CL', 'Caracas,VE', 'Havana,CU'
 ]
 
-@lru_cache(maxsize=128)
+CURATED_SPOTIFY_PLAYLISTS = {
+    'sunny': [
+        {'name': 'Sunny Day Vibes', 'query': 'sunny happy upbeat pop', 'description': 'Perfect for bright sunny days'},
+        {'name': 'Beach Essentials', 'query': 'beach tropical summer', 'description': 'Summer beach anthems'},
+        {'name': 'Feel Good Energy', 'query': 'feel good energy positive', 'description': 'Uplifting energy boosters'}
+    ],
+    'rainy': [
+        {'name': 'Rainy Day Lofi', 'query': 'lofi hip hop chill beats', 'description': 'Chill beats for rainy days'},
+        {'name': 'Jazz in the Rain', 'query': 'jazz piano relaxing', 'description': 'Smooth jazz for stormy weather'},
+        {'name': 'Cozy Acoustic', 'query': 'acoustic indie folk', 'description': 'Warm acoustic melodies'}
+    ],
+    'cloudy': [
+        {'name': 'Chill Vibes', 'query': 'chill vibes ambient', 'description': 'Relaxing ambient sounds'},
+        {'name': 'Downtempo Electronica', 'query': 'downtempo electronic chill', 'description': 'Electronic chill music'},
+        {'name': 'Indie Essentials', 'query': 'indie alternative rock', 'description': 'Indie rock favorites'}
+    ],
+    'snow': [
+        {'name': 'Winter Wonderland', 'query': 'winter christmas acoustic', 'description': 'Cozy winter sounds'},
+        {'name': 'Fireside Sessions', 'query': 'acoustic guitar instrumental', 'description': 'Warm acoustic melodies'},
+        {'name': 'Peaceful Piano', 'query': 'peaceful piano classical', 'description': 'Calm piano compositions'}
+    ],
+    'storm': [
+        {'name': 'Epic Soundtracks', 'query': 'epic cinematic orchestral', 'description': 'Dramatic orchestral music'},
+        {'name': 'Intense Focus', 'query': 'intense focus concentration', 'description': 'Deep concentration music'},
+        {'name': 'Dark Academia', 'query': 'classical dark orchestral', 'description': 'Dark classical themes'}
+    ]
+}
+
+def get_moon_phase():
+    year = datetime.now().year
+    month = datetime.now().month
+    day = datetime.now().day
+    
+    c = e = jd = b = 0
+    
+    if month < 3:
+        year -= 1
+        month += 12
+    
+    month += 1
+    c = 365.25 * year
+    e = 30.6 * month
+    jd = c + e + day - 694039.09
+    jd /= 29.5305882
+    b = int(jd)
+    jd -= b
+    b = round(jd * 8)
+    
+    if b >= 8:
+        b = 0
+    
+    phases = ['New Moon', 'Waxing Crescent', 'First Quarter', 'Waxing Gibbous',
+              'Full Moon', 'Waning Gibbous', 'Last Quarter', 'Waning Crescent']
+    
+    emojis = ['🌑', '🌒', '🌓', '🌔', '🌕', '🌖', '🌗', '🌘']
+    
+    return {'phase': phases[b], 'emoji': emojis[b], 'illumination': round(jd * 100)}
+
+@lru_cache(maxsize=10)
 def get_spotify_token():
     if not SPOTIFY_CLIENT_ID or not SPOTIFY_CLIENT_SECRET:
+        logger.warning("Spotify credentials not configured")
         return None
     
     auth_string = f"{SPOTIFY_CLIENT_ID}:{SPOTIFY_CLIENT_SECRET}"
@@ -148,11 +318,13 @@ def get_spotify_token():
     try:
         response = requests.post(url, headers=headers, data=data, timeout=10)
         response.raise_for_status()
-        return response.json().get('access_token')
+        token_data = response.json()
+        return token_data.get('access_token')
     except Exception as e:
         logger.error(f"Spotify authentication failed: {e}")
         return None
 
+@cache_with_expiry(expiry_seconds=300)
 def get_location_from_ip(ip_address=None):
     try:
         if IPGEOLOCATION_API_KEY:
@@ -166,7 +338,9 @@ def get_location_from_ip(ip_address=None):
                 'country': data.get('country_name', 'Unknown'),
                 'lat': float(data.get('latitude', 0)),
                 'lon': float(data.get('longitude', 0)),
-                'timezone': data.get('time_zone', {}).get('name', 'UTC')
+                'timezone': data.get('time_zone', {}).get('name', 'UTC'),
+                'state': data.get('state_prov', ''),
+                'zipcode': data.get('zipcode', '')
             }
         else:
             url = f"http://ip-api.com/json/{ip_address}" if ip_address else "http://ip-api.com/json/"
@@ -177,7 +351,9 @@ def get_location_from_ip(ip_address=None):
                 'country': data.get('country', 'Unknown'),
                 'lat': data.get('lat', 0),
                 'lon': data.get('lon', 0),
-                'timezone': data.get('timezone', 'UTC')
+                'timezone': data.get('timezone', 'UTC'),
+                'state': data.get('regionName', ''),
+                'zipcode': data.get('zip', '')
             }
     except Exception as e:
         logger.error(f"IP geolocation failed: {e}")
@@ -186,22 +362,28 @@ def get_location_from_ip(ip_address=None):
             'country': 'USA',
             'lat': 40.7128,
             'lon': -74.0060,
-            'timezone': 'America/New_York'
+            'timezone': 'America/New_York',
+            'state': 'New York',
+            'zipcode': '10001'
         }
 
 def get_greeting(timezone='UTC'):
     try:
         hour = datetime.utcnow().hour
-        if hour < 6:
-            return "Good Night"
-        elif hour < 12:
-            return "Good Morning"
-        elif hour < 18:
-            return "Good Afternoon"
-        elif hour < 22:
-            return "Good Evening"
-        else:
-            return "Good Night"
+        
+        greetings = {
+            (0, 5): ["Good Night", "Sleep Well", "Sweet Dreams"],
+            (5, 12): ["Good Morning", "Rise and Shine", "Morning Sunshine"],
+            (12, 17): ["Good Afternoon", "Have a Great Day", "Afternoon Delight"],
+            (17, 21): ["Good Evening", "Evening Greetings", "Pleasant Evening"],
+            (21, 24): ["Good Night", "Evening Relaxation", "Peaceful Night"]
+        }
+        
+        for (start, end), messages in greetings.items():
+            if start <= hour < end:
+                return random.choice(messages)
+        
+        return "Hello"
     except:
         return "Hello"
 
@@ -210,7 +392,25 @@ def calculate_uv_index(lat, lon):
         url = f"https://api.openweathermap.org/data/2.5/uvi?lat={lat}&lon={lon}&appid={OPENWEATHER_API_KEY}"
         response = requests.get(url, timeout=5)
         data = response.json()
-        return data.get('value', 0)
+        uv_value = data.get('value', 0)
+        
+        if uv_value < 3:
+            level = 'Low'
+            advice = 'No protection required'
+        elif uv_value < 6:
+            level = 'Moderate'
+            advice = 'Protection required'
+        elif uv_value < 8:
+            level = 'High'
+            advice = 'Protection required'
+        elif uv_value < 11:
+            level = 'Very High'
+            advice = 'Extra protection required'
+        else:
+            level = 'Extreme'
+            advice = 'Avoid sun exposure'
+        
+        return {'value': uv_value, 'level': level, 'advice': advice}
     except:
         return None
 
@@ -222,29 +422,104 @@ def get_air_quality(lat, lon):
         aqi = data['list'][0]['main']['aqi']
         components = data['list'][0]['components']
         
-        aqi_levels = {1: 'Good', 2: 'Fair', 3: 'Moderate', 4: 'Poor', 5: 'Very Poor'}
+        aqi_levels = {
+            1: {'level': 'Good', 'color': '#00e400', 'advice': 'Air quality is perfect. Great day for outdoor activities!'},
+            2: {'level': 'Fair', 'color': '#ffff00', 'advice': 'Air quality is acceptable. Sensitive groups should limit prolonged outdoor exertion.'},
+            3: {'level': 'Moderate', 'color': '#ff7e00', 'advice': 'Members of sensitive groups may experience health effects.'},
+            4: {'level': 'Poor', 'color': '#ff0000', 'advice': 'Everyone may begin to experience health effects.'},
+            5: {'level': 'Very Poor', 'color': '#8f3f97', 'advice': 'Health alert! Everyone may experience more serious health effects.'}
+        }
+        
+        aqi_info = aqi_levels.get(aqi, aqi_levels[1])
         
         return {
             'aqi': aqi,
-            'level': aqi_levels.get(aqi, 'Unknown'),
+            'level': aqi_info['level'],
+            'color': aqi_info['color'],
+            'advice': aqi_info['advice'],
             'components': {
-                'pm2_5': components.get('pm2_5'),
-                'pm10': components.get('pm10'),
-                'o3': components.get('o3'),
-                'no2': components.get('no2')
+                'pm2_5': round(components.get('pm2_5', 0), 2),
+                'pm10': round(components.get('pm10', 0), 2),
+                'o3': round(components.get('o3', 0), 2),
+                'no2': round(components.get('no2', 0), 2),
+                'co': round(components.get('co', 0), 2),
+                'so2': round(components.get('so2', 0), 2)
             }
         }
     except Exception as e:
         logger.error(f"Air quality fetch failed: {e}")
         return None
 
+def calculate_weather_score(data):
+    score = 50
+    
+    temp = data.get('temperature', {}).get('current', 20)
+    if 18 <= temp <= 25:
+        score += 20
+    elif 15 <= temp <= 30:
+        score += 10
+    else:
+        score -= 10
+    
+    humidity = data.get('details', {}).get('humidity', 50)
+    if 30 <= humidity <= 60:
+        score += 15
+    elif humidity > 80:
+        score -= 10
+    
+    wind_speed = data.get('details', {}).get('wind', {}).get('speed', 0)
+    if wind_speed < 5:
+        score += 10
+    elif wind_speed > 15:
+        score -= 10
+    
+    weather_main = data.get('weather', {}).get('main', 'Clear')
+    if weather_main == 'Clear':
+        score += 15
+    elif weather_main in ['Rain', 'Thunderstorm', 'Snow']:
+        score -= 15
+    
+    return max(0, min(100, score))
+
+def get_best_time_today(forecast_data):
+    if not forecast_data or 'list' not in forecast_data:
+        return None
+    
+    best_time = None
+    best_score = 0
+    
+    for item in forecast_data['list'][:8]:
+        temp = item['main']['temp']
+        weather = item['weather'][0]['main']
+        wind = item['wind']['speed']
+        
+        score = 50
+        if 18 <= temp <= 25:
+            score += 30
+        if weather == 'Clear':
+            score += 20
+        if wind < 5:
+            score += 10
+        
+        if score > best_score:
+            best_score = score
+            best_time = {
+                'time': datetime.fromtimestamp(item['dt']).strftime('%I:%M %p'),
+                'temperature': round(temp, 1),
+                'weather': weather,
+                'score': score
+            }
+    
+    return best_time
+
 @app.route('/health', methods=['GET'])
 def health_check():
     return jsonify({
         'status': 'healthy',
-        'service': 'Weather Visualizer API',
-        'version': '1.0.0',
-        'timestamp': datetime.utcnow().isoformat()
+        'service': 'Weather Visualizer API Pro',
+        'version': '2.0.0',
+        'timestamp': datetime.utcnow().isoformat(),
+        'features': ['Weather', 'Forecast', 'Air Quality', 'UV Index', 'Spotify', 'Moon Phase', 'Activities']
     }), 200
 
 @app.route('/api/location/auto', methods=['GET'])
@@ -257,18 +532,21 @@ def auto_detect_location():
     location = get_location_from_ip(ip_address)
     greeting = get_greeting(location.get('timezone', 'UTC'))
     
+    moon = get_moon_phase()
+    
     return jsonify({
         'success': True,
         'location': location,
         'greeting': greeting,
+        'moon_phase': moon,
         'timestamp': datetime.utcnow().isoformat()
     }), 200
 
 @app.route('/api/weather/current', methods=['GET'])
-@limiter.limit("100 per hour")
+@limiter.limit("150 per hour")
 def get_current_weather():
     if not OPENWEATHER_API_KEY:
-        return jsonify({'error': 'Weather service not configured'}), 500
+        return jsonify({'error': 'Weather service not configured', 'success': False}), 500
     
     city = request.args.get('city')
     lat = request.args.get('lat', type=float)
@@ -313,7 +591,8 @@ def get_current_weather():
                 'main': weather_main,
                 'description': data['weather'][0]['description'].title(),
                 'icon': data['weather'][0]['icon'],
-                'mood': weather_config['mood']
+                'mood': weather_config['mood'],
+                'emoji': weather_config['emoji']
             },
             'temperature': {
                 'current': round(data['main']['temp'], 1),
@@ -346,8 +625,13 @@ def get_current_weather():
                 'sunrise': datetime.fromtimestamp(data['sys']['sunrise']).isoformat(),
                 'sunset': datetime.fromtimestamp(data['sys']['sunset']).isoformat()
             },
+            'color_palette': weather_config['color_palette'],
+            'clothing_recommendations': weather_config['clothing'],
+            'health_tips': weather_config['health_tips'],
             'timestamp': datetime.fromtimestamp(data['dt']).isoformat()
         }
+        
+        result['weather_score'] = calculate_weather_score(result)
         
         return jsonify(result), 200
         
@@ -356,10 +640,10 @@ def get_current_weather():
         return jsonify({'error': 'Weather service unavailable', 'success': False}), 503
 
 @app.route('/api/weather/forecast', methods=['GET'])
-@limiter.limit("100 per hour")
+@limiter.limit("150 per hour")
 def get_forecast():
     if not OPENWEATHER_API_KEY:
-        return jsonify({'error': 'Weather service not configured'}), 500
+        return jsonify({'error': 'Weather service not configured', 'success': False}), 500
     
     city = request.args.get('city')
     lat = request.args.get('lat', type=float)
@@ -400,14 +684,18 @@ def get_forecast():
             date_key = dt.date().isoformat()
             
             if include_hourly:
+                weather_main = item['weather'][0]['main']
+                weather_config = WEATHER_CONDITION_MAP.get(weather_main, WEATHER_CONDITION_MAP['Clear'])
+                
                 hourly_forecast.append({
                     'datetime': dt.isoformat(),
                     'temperature': round(item['main']['temp'], 1),
                     'feels_like': round(item['main']['feels_like'], 1),
                     'weather': {
-                        'main': item['weather'][0]['main'],
+                        'main': weather_main,
                         'description': item['weather'][0]['description'].title(),
-                        'icon': item['weather'][0]['icon']
+                        'icon': item['weather'][0]['icon'],
+                        'emoji': weather_config['emoji']
                     },
                     'humidity': item['main']['humidity'],
                     'wind_speed': item['wind']['speed'],
@@ -436,8 +724,11 @@ def get_forecast():
         
         daily_summary = []
         for date, forecast in list(daily_forecast.items())[:days]:
+            weather_config = WEATHER_CONDITION_MAP.get(forecast['weather'], WEATHER_CONDITION_MAP['Clear'])
+            
             daily_summary.append({
                 'date': date,
+                'day_name': datetime.fromisoformat(date).strftime('%A'),
                 'temperature': {
                     'min': round(min(forecast['temps']), 1),
                     'max': round(max(forecast['temps']), 1),
@@ -446,7 +737,8 @@ def get_forecast():
                 'weather': {
                     'main': forecast['weather'],
                     'description': forecast['description'],
-                    'icon': forecast['icon']
+                    'icon': forecast['icon'],
+                    'emoji': weather_config['emoji']
                 },
                 'humidity': round(sum(forecast['humidity']) / len(forecast['humidity'])),
                 'wind_speed': round(sum(forecast['wind_speed']) / len(forecast['wind_speed']), 1),
@@ -454,17 +746,21 @@ def get_forecast():
                 'pressure': round(sum(forecast['pressure']) / len(forecast['pressure']))
             })
         
+        city_data = data.get('city', {})
+        coord_data = city_data.get('coord', {})
+        
         result = {
             'success': True,
             'location': {
-                'name': data['city']['name'],
-                'country': data['city']['country'],
+                'name': city_data.get('name', 'Unknown'),
+                'country': city_data.get('country', 'Unknown'),
                 'coordinates': {
-                    'lat': data['city']['coord']['lat'],
-                    'lon': data['city']['coord']['lon']
+                    'lat': coord_data.get('lat', lat),
+                    'lon': coord_data.get('lon', lon)
                 }
             },
             'daily': daily_summary,
+            'best_time_today': get_best_time_today(data),
             'unit': '°C' if units == 'metric' else '°F'
         }
         
@@ -514,21 +810,70 @@ def get_weather_alerts():
             'success': True,
             'location': {'lat': lat, 'lon': lon},
             'alerts': formatted_alerts,
-            'count': len(formatted_alerts)
+            'count': len(formatted_alerts),
+            'has_alerts': len(formatted_alerts) > 0
         }), 200
         
     except:
         return jsonify({
             'success': True,
             'alerts': [],
-            'count': 0
+            'count': 0,
+            'has_alerts': False
         }), 200
+
+@app.route('/api/weather/compare', methods=['GET'])
+@limiter.limit("50 per hour")
+def compare_cities():
+    cities = request.args.get('cities', '').split(',')
+    units = request.args.get('units', 'metric')
+    
+    if len(cities) > 5:
+        return jsonify({'error': 'Maximum 5 cities allowed', 'success': False}), 400
+    
+    comparison = []
+    
+    for city in cities[:5]:
+        city = city.strip()
+        if not city:
+            continue
+        
+        url = f"https://api.openweathermap.org/data/2.5/weather?q={city}&units={units}&appid={OPENWEATHER_API_KEY}"
+        
+        try:
+            response = requests.get(url, timeout=5)
+            response.raise_for_status()
+            data = response.json()
+            
+            weather_config = WEATHER_CONDITION_MAP.get(data['weather'][0]['main'], WEATHER_CONDITION_MAP['Clear'])
+            
+            comparison.append({
+                'city': data['name'],
+                'country': data['sys']['country'],
+                'temperature': round(data['main']['temp'], 1),
+                'feels_like': round(data['main']['feels_like'], 1),
+                'weather': {
+                    'main': data['weather'][0]['main'],
+                    'description': data['weather'][0]['description'].title(),
+                    'emoji': weather_config['emoji']
+                },
+                'humidity': data['main']['humidity'],
+                'wind_speed': data['wind']['speed']
+            })
+        except:
+            continue
+    
+    return jsonify({
+        'success': True,
+        'comparison': comparison,
+        'count': len(comparison)
+    }), 200
 
 @app.route('/api/weather/explore', methods=['GET'])
 @limiter.limit("50 per hour")
 def explore_random_weather():
-    count = request.args.get('count', 1, type=int)
-    count = min(count, 5)
+    count = request.args.get('count', 4, type=int)
+    count = min(count, 8)
     units = request.args.get('units', 'metric')
     
     cities = random.sample(GLOBAL_CITIES, count)
@@ -541,6 +886,8 @@ def explore_random_weather():
             response.raise_for_status()
             data = response.json()
             
+            weather_config = WEATHER_CONDITION_MAP.get(data['weather'][0]['main'], WEATHER_CONDITION_MAP['Clear'])
+            
             results.append({
                 'city': data['name'],
                 'country': data['sys']['country'],
@@ -549,12 +896,14 @@ def explore_random_weather():
                 'weather': {
                     'main': data['weather'][0]['main'],
                     'description': data['weather'][0]['description'].title(),
-                    'icon': data['weather'][0]['icon']
+                    'icon': data['weather'][0]['icon'],
+                    'emoji': weather_config['emoji']
                 },
                 'coordinates': {
                     'lat': data['coord']['lat'],
                     'lon': data['coord']['lon']
-                }
+                },
+                'local_time': datetime.utcnow().isoformat()
             })
         except:
             continue
@@ -567,10 +916,13 @@ def explore_random_weather():
 
 @app.route('/api/insights/fun-fact', methods=['GET'])
 def get_fun_fact():
+    category = request.args.get('category', 'all')
+    
     return jsonify({
         'success': True,
         'fact': random.choice(WEATHER_FUN_FACTS),
         'category': 'weather',
+        'total_facts': len(WEATHER_FUN_FACTS),
         'timestamp': datetime.utcnow().isoformat()
     }), 200
 
@@ -584,12 +936,16 @@ def get_activity_suggestions():
     
     if temp:
         if temp > 30:
-            activities.extend(['Swimming', 'Water park', 'Indoor AC activities', 'Ice cream'])
+            activities.extend(['Swimming', 'Water park', 'Indoor AC activities', 'Ice cream hunt', 'Beach volleyball'])
+        elif temp > 25:
+            activities.extend(['Outdoor sports', 'Park picnic', 'Cycling'])
         elif temp < 5:
-            activities.extend(['Indoor activities', 'Hot beverages', 'Cozy indoor time'])
+            activities.extend(['Indoor activities', 'Hot beverages', 'Cozy indoor time', 'Winter sports'])
+        elif temp < 15:
+            activities.extend(['Brisk walk', 'Layered outdoor activities'])
     
     activities = list(set(activities))
-    suggested = random.sample(activities, min(4, len(activities)))
+    suggested = random.sample(activities, min(5, len(activities)))
     
     return jsonify({
         'success': True,
@@ -597,7 +953,8 @@ def get_activity_suggestions():
         'temperature': temp,
         'mood': weather_config['mood'],
         'suggested_activities': suggested,
-        'all_activities': activities
+        'all_activities': activities,
+        'emoji': weather_config['emoji']
     }), 200
 
 @app.route('/api/entertainment/spotify', methods=['GET'])
@@ -607,7 +964,18 @@ def get_spotify_playlists():
     limit = request.args.get('limit', 5, type=int)
     
     weather_config = WEATHER_CONDITION_MAP.get(weather, WEATHER_CONDITION_MAP['Clear'])
-    playlist_query = weather_config['playlist']
+    
+    weather_category = 'sunny'
+    if weather in ['Rain', 'Drizzle']:
+        weather_category = 'rainy'
+    elif weather in ['Clouds', 'Mist', 'Fog', 'Haze']:
+        weather_category = 'cloudy'
+    elif weather == 'Snow':
+        weather_category = 'snow'
+    elif weather in ['Thunderstorm', 'Tornado']:
+        weather_category = 'storm'
+    
+    curated = CURATED_SPOTIFY_PLAYLISTS.get(weather_category, CURATED_SPOTIFY_PLAYLISTS['sunny'])
     
     token = get_spotify_token()
     
@@ -616,43 +984,53 @@ def get_spotify_playlists():
             'success': False,
             'message': 'Spotify service unavailable',
             'weather': weather,
-            'mood': playlist_query
-        }), 503
-    
-    search_url = f"https://api.spotify.com/v1/search?q={playlist_query}&type=playlist&limit={limit}"
-    headers = {"Authorization": f"Bearer {token}"}
-    
-    try:
-        response = requests.get(search_url, headers=headers, timeout=10)
-        response.raise_for_status()
-        data = response.json()
-        
-        playlists = []
-        for item in data['playlists']['items']:
-            playlists.append({
-                'name': item['name'],
-                'description': item.get('description', ''),
-                'url': item['external_urls']['spotify'],
-                'image': item['images'][0]['url'] if item['images'] else None,
-                'tracks': item['tracks']['total'],
-                'owner': item['owner']['display_name']
-            })
-        
-        return jsonify({
-            'success': True,
-            'weather': weather,
             'mood': weather_config['mood'],
-            'query': playlist_query,
-            'playlists': playlists
+            'curated_suggestions': curated
         }), 200
+    
+    all_playlists = []
+    
+    for playlist_info in curated:
+        search_url = f"https://api.spotify.com/v1/search?q={playlist_info['query']}&type=playlist&limit=2"
+        headers = {"Authorization": f"Bearer {token}"}
         
-    except Exception as e:
-        logger.error(f"Spotify API error: {e}")
+        try:
+            response = requests.get(search_url, headers=headers, timeout=10)
+            response.raise_for_status()
+            data = response.json()
+            
+            if data and 'playlists' in data and data['playlists'] and 'items' in data['playlists']:
+                for item in data['playlists']['items'][:2]:
+                    all_playlists.append({
+                        'name': item['name'],
+                        'description': item.get('description', playlist_info['description']),
+                        'url': item['external_urls']['spotify'],
+                        'image': item['images'][0]['url'] if item['images'] else None,
+                        'tracks': item['tracks']['total'],
+                        'owner': item['owner']['display_name'],
+                        'category': weather_category
+                    })
+        except Exception as e:
+            logger.error(f"Spotify search error for {playlist_info['query']}: {e}")
+            continue
+    
+    if not all_playlists:
         return jsonify({
             'success': False,
-            'error': 'Spotify service error',
-            'weather': weather
-        }), 503
+            'message': 'No playlists found',
+            'weather': weather,
+            'mood': weather_config['mood'],
+            'curated_suggestions': curated
+        }), 200
+    
+    return jsonify({
+        'success': True,
+        'weather': weather,
+        'mood': weather_config['mood'],
+        'category': weather_category,
+        'playlists': all_playlists[:limit],
+        'total_found': len(all_playlists)
+    }), 200
 
 @app.route('/api/entertainment/sounds', methods=['GET'])
 def get_ambient_sounds():
@@ -660,15 +1038,22 @@ def get_ambient_sounds():
     
     weather_config = WEATHER_CONDITION_MAP.get(weather, WEATHER_CONDITION_MAP['Clear'])
     
-    all_sounds = {k: v['sound'] for k, v in WEATHER_CONDITION_MAP.items()}
+    all_sounds = {k: {
+        'url': v['sound'],
+        'mood': v['mood'],
+        'emoji': v['emoji']
+    } for k, v in WEATHER_CONDITION_MAP.items()}
     
     return jsonify({
         'success': True,
         'weather': weather,
         'mood': weather_config['mood'],
-        'primary_sound': weather_config['sound'],
+        'primary_sound': {
+            'url': weather_config['sound'],
+            'description': f"Ambient {weather.lower()} sounds for relaxation"
+        },
         'all_sounds': all_sounds,
-        'description': f"Ambient {weather.lower()} sounds for relaxation"
+        'emoji': weather_config['emoji']
     }), 200
 
 @app.route('/api/analytics/summary', methods=['GET'])
@@ -700,6 +1085,10 @@ def get_weather_summary():
         upcoming_temps = [item['main']['temp'] for item in forecast_data['list'][:8]]
         upcoming_conditions = [item['weather'][0]['main'] for item in forecast_data['list'][:8]]
         
+        uv_index = calculate_uv_index(lat, lon)
+        air_quality = get_air_quality(lat, lon)
+        moon = get_moon_phase()
+        
         summary = {
             'success': True,
             'location': {
@@ -709,7 +1098,8 @@ def get_weather_summary():
             'current': {
                 'temperature': round(current_data['main']['temp'], 1),
                 'condition': weather_main,
-                'description': current_data['weather'][0]['description'].title()
+                'description': current_data['weather'][0]['description'].title(),
+                'emoji': weather_config['emoji']
             },
             'today_forecast': {
                 'high': round(max(upcoming_temps), 1),
@@ -719,9 +1109,29 @@ def get_weather_summary():
             'insights': {
                 'mood': weather_config['mood'],
                 'activity': random.choice(weather_config['activities']),
-                'fun_fact': random.choice(WEATHER_FUN_FACTS)
+                'fun_fact': random.choice(WEATHER_FUN_FACTS),
+                'color_palette': weather_config['color_palette']
+            },
+            'health': {
+                'uv_index': uv_index,
+                'air_quality': air_quality,
+                'clothing': weather_config['clothing'],
+                'tips': weather_config['health_tips']
+            },
+            'astronomy': {
+                'moon_phase': moon,
+                'sunrise': datetime.fromtimestamp(current_data['sys']['sunrise']).strftime('%I:%M %p'),
+                'sunset': datetime.fromtimestamp(current_data['sys']['sunset']).strftime('%I:%M %p')
             },
             'upcoming_changes': len(set(upcoming_conditions)) > 1,
+            'weather_score': calculate_weather_score({
+                'temperature': {'current': current_data['main']['temp']},
+                'details': {
+                    'humidity': current_data['main']['humidity'],
+                    'wind': {'speed': current_data['wind']['speed']}
+                },
+                'weather': {'main': weather_main}
+            }),
             'timestamp': datetime.utcnow().isoformat()
         }
         
@@ -731,12 +1141,59 @@ def get_weather_summary():
         logger.error(f"Summary generation failed: {e}")
         return jsonify({'error': 'Summary unavailable', 'success': False}), 503
 
+@app.route('/api/preferences/save', methods=['POST'])
+def save_preferences():
+    data = request.get_json()
+    
+    if 'session' not in globals():
+        session['preferences'] = {}
+    
+    session['preferences'] = {
+        'units': data.get('units', 'metric'),
+        'favorite_locations': data.get('favorite_locations', []),
+        'theme': data.get('theme', 'auto'),
+        'notifications': data.get('notifications', True)
+    }
+    
+    return jsonify({
+        'success': True,
+        'message': 'Preferences saved',
+        'preferences': session.get('preferences', {})
+    }), 200
+
+@app.route('/api/preferences/get', methods=['GET'])
+def get_preferences():
+    preferences = session.get('preferences', {
+        'units': 'metric',
+        'favorite_locations': [],
+        'theme': 'auto',
+        'notifications': True
+    })
+    
+    return jsonify({
+        'success': True,
+        'preferences': preferences
+    }), 200
+
 @app.errorhandler(404)
 def not_found(error):
     return jsonify({
         'success': False,
         'error': 'Endpoint not found',
-        'code': 404
+        'code': 404,
+        'available_endpoints': [
+            '/api/location/auto',
+            '/api/weather/current',
+            '/api/weather/forecast',
+            '/api/weather/alerts',
+            '/api/weather/explore',
+            '/api/weather/compare',
+            '/api/insights/fun-fact',
+            '/api/insights/activities',
+            '/api/entertainment/spotify',
+            '/api/entertainment/sounds',
+            '/api/analytics/summary'
+        ]
     }), 404
 
 @app.errorhandler(500)
@@ -751,7 +1208,7 @@ def internal_error(error):
 def ratelimit_handler(e):
     return jsonify({
         'success': False,
-        'error': 'Rate limit exceeded',
+        'error': 'Rate limit exceeded. Please try again later.',
         'code': 429
     }), 429
 

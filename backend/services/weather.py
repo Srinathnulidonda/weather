@@ -940,8 +940,9 @@ class UltraWeatherService:
                 return data['Key']
     
     async def _get_accuweather_air_quality(self, lat: float, lon: float) -> AirQualityData:
+
         location_key = await self._get_accuweather_location_key(lat, lon)
-        
+
         url = f"http://dataservice.accuweather.com/airquality/v2/current/{location_key}"
         params = {'apikey': self.accuweather_api_key}
         
@@ -982,7 +983,13 @@ class UltraWeatherService:
                     so2=data[0].get('SO2', 0),
                     health_recommendation=self._get_enhanced_air_quality_advice(aqi)
                 )
-    
+        try:
+            logger.info("AccuWeather air quality not available in free tier")
+            return None
+        except Exception as e:
+            logger.warning(f"AccuWeather air quality error: {e}")
+            return None
+
     async def _get_accuweather_forecast(self, lat: float, lon: float, days: int) -> List[Dict]:
         location_key = await self._get_accuweather_location_key(lat, lon)
         
@@ -1035,9 +1042,11 @@ class UltraWeatherService:
             'apikey': self.tomorrow_api_key,
             'fields': 'temperature,temperatureApparent,humidity,pressureSeaLevel,windSpeed,windDirection,visibility,uvIndex,cloudCover,weatherCode,precipitationIntensity,dewPoint'
         }
-        
+    
         async with aiohttp.ClientSession() as session:
             async with session.get(url, params=params, timeout=10) as response:
+                if response.status == 429:
+                    raise Exception("Tomorrow.io rate limit exceeded")
                 if response.status != 200:
                     raise Exception(f"Tomorrow.io API error: {response.status}")
                 

@@ -688,6 +688,339 @@ class UltraAccurateLocationService:
                     )
             except aiohttp.ClientError as e:
                 raise LocationServiceError(f"IPAPI connection error: {e}")
+
+    # Add these methods to the UltraAccurateLocationService class in location.py
+
+    async def search_location(self, query: str) -> List[Dict]:
+        """Search for locations by name/address using Google Maps or Nominatim"""
+        
+        if not query or len(query) < 2:
+            return []
+        
+        logger.info(f"Searching for location: {query}")
+        
+        # Try Google Maps first if available
+        if self.google_maps_key:
+            try:
+                results = await self._search_google_places(query)
+                if results:
+                    return results
+            except Exception as e:
+                logger.warning(f"Google Places search failed: {e}")
+        
+        # Fallback to Nominatim
+        try:
+            results = await self._search_nominatim(query)
+            return results
+        except Exception as e:
+            logger.error(f"Nominatim search failed: {e}")
+            return []
+
+    async def _search_google_places(self, query: str) -> List[Dict]:
+        """Search using Google Places API"""
+        
+        # First try Places Autocomplete for better results
+        autocomplete_url = "https://maps.googleapis.com/maps/api/place/autocomplete/json"
+        params = {
+            'input': query,
+            'key': self.google_maps_key,
+            'types': '(cities)|geocode',
+            'language': 'en'
+        }
+        
+        results = []
+        
+        async with aiohttp.ClientSession() as session:
+            # Get place predictions
+            async with session.get(autocomplete_url, params=params, timeout=5) as response:
+                if response.status != 200:
+                    raise Exception(f"Google Places API error: {response.status}")
+                
+                data = await response.json()
+                
+                if data.get('status') != 'OK' or not data.get('predictions'):
+                    # Try regular geocoding as fallback
+                    return await self._search_google_geocoding(query)
+                
+                # Get details for each prediction
+                for prediction in data['predictions'][:5]:  # Limit to 5 results
+                    place_id = prediction['place_id']
+                    
+                    # Get place details including coordinates
+                    details_url = "https://maps.googleapis.com/maps/api/place/details/json"
+                    details_params = {
+                        'place_id': place_id,
+                        'key': self.google_maps_key,
+                        'fields': 'geometry,formatted_address,address_components,name'
+                    }
+                    
+                    async with session.get(details_url, params=details_params, timeout=5) as detail_response:
+                        if detail_response.status == 200:
+                            detail_data = await detail_response.json()
+                            
+                            if detail_data.get('status') == 'OK' and detail_data.get('result'):
+                                result = detail_data['result']
+                                geometry = result.get('geometry', {})
+                                location = geometry.get('location', {})
+                                
+                                # Extract address components
+                                components = result.get('address_components', [])
+                                city = ''
+                                state = ''
+                                country = ''
+                                
+                                for component in components:
+                                    types = component.get('types', [])
+                                    if 'locality' in types:
+                                        city = component.get('long_name', '')
+                                    elif 'administrative_area_level_1' in types:
+                                        state = component.get('long_name', '')
+                                    elif 'country' in types:
+                                        country = component.get('long_name', '')
+                                
+                                results.append({
+                                    'place_id': place_id,
+                                    'display_name': result.get('formatted_address', ''),
+                                    'name': result.get('name', ''),
+                                    'lat': location.get('lat'),
+                                    'lon': location.get('lng'),
+                                    'city': city,
+                                    'state': state,
+                                    'country': country,
+                                    'type': 'place',
+                                    'source': 'google_places'
+                                })
+        
+        return results
+
+    async def _search_google_geocoding(self, query: str) -> List[Dict]:
+        """Search using Google Geocoding API"""
+        
+        url = "https://maps.googleapis.com/maps/api/geocode/json"
+        params = {
+            'address': query,
+            'key': self.google_maps_key,
+            'language': 'en'
+        }
+        
+        results = []
+        
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, params=params, timeout=5) as response:
+                if response.status != 200:
+                    raise Exception(f"Google Geocoding API error: {response.status}")
+                
+                data = await response.json()
+                
+                if data.get('status') != 'OK' or not data.get('results'):
+                    return []
+                
+                for result in data['results'][:5]:  # Limit to 5 results
+                    geometry = result.get('geometry', {})
+                    location = geometry.get('location', {})
+                    components = result.get('address_components', [])
+                    
+                    city = ''
+                    state = ''
+                    country = ''
+                    
+                    for component in components:
+                        types = component.get('types', [])
+                        if 'locality' in types:
+                            city = component.get('long_name', '')
+                        elif 'administrative_area_level_1' in types:
+                            state = component.get('long_name', '')
+                        elif 'country' in types:
+                            country = component.get('long_name', '')
+                    
+                    results.append({
+                        'place_id': result.get('place_id', ''),
+                        'display_name': result.get('formatted_address', ''),
+                        'name': city or result.get('formatted_address', '').split(',')[0],
+                        'lat': location.get('lat'),
+                        'lon': location.get('lng'),
+                        'city': city,
+                        'state': state,
+                        'country': country,
+                        'type': result.get('types', [''])[0],
+                        'source': 'google_geocoding'
+                    })
+        
+        return results
+
+    async def _search_nominatim(self, query: str) -> List[Dict]:
+        """Search using Nominatim (OpenStreetMap)"""
+        
+        url = "https://nominatim.openstreetmap.org/search"
+        params = {
+            'q': query,
+            'format': 'json',
+            'addressdetails': 1,
+            'limit': 5,
+            'accept-language': 'en'
+        }
+        headers = {'User-Agent': 'SkyVibeWeatherApp/4.0'}
+        
+        results = []
+        
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, params=params, headers=headers, timeout=5) as response:
+                if response.status != 200:
+                    raise Exception(f"Nominatim API error: {response.status}")
+                
+                data = await response.json()
+                
+                for item in data:
+                    address = item.get('address', {})
+                    
+                    # Extract city name
+                    city = (address.get('city') or 
+                        address.get('town') or 
+                        address.get('village') or 
+                        address.get('municipality', ''))
+                    
+                    results.append({
+                        'place_id': item.get('place_id', ''),
+                        'display_name': item.get('display_name', ''),
+                        'name': item.get('name', '') or city,
+                        'lat': float(item.get('lat', 0)),
+                        'lon': float(item.get('lon', 0)),
+                        'city': city,
+                        'state': address.get('state', ''),
+                        'country': address.get('country', ''),
+                        'type': item.get('type', ''),
+                        'source': 'nominatim'
+                    })
+        
+        return results
+
+    async def get_location_from_place_id(self, place_id: str, source: str = 'google') -> LocationResult:
+        """Get detailed location from a place ID"""
+        
+        if source == 'google_places' and self.google_maps_key:
+            return await self._get_location_from_google_place_id(place_id)
+        elif source == 'nominatim':
+            return await self._get_location_from_nominatim_place_id(place_id)
+        else:
+            raise LocationServiceError(f"Unknown source: {source}")
+
+    async def _get_location_from_google_place_id(self, place_id: str) -> LocationResult:
+        """Get location details from Google place ID"""
+        
+        url = "https://maps.googleapis.com/maps/api/place/details/json"
+        params = {
+            'place_id': place_id,
+            'key': self.google_maps_key,
+            'fields': 'geometry,formatted_address,address_components,name'
+        }
+        
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, params=params, timeout=5) as response:
+                if response.status != 200:
+                    raise LocationServiceError(f"Google Place Details API error: {response.status}")
+                
+                data = await response.json()
+                
+                if data.get('status') != 'OK' or not data.get('result'):
+                    raise LocationServiceError("Place not found")
+                
+                result = data['result']
+                geometry = result.get('geometry', {})
+                location = geometry.get('location', {})
+                components = result.get('address_components', [])
+                
+                location_result = LocationResult(
+                    lat=location.get('lat'),
+                    lon=location.get('lng'),
+                    accuracy=0.99,
+                    confidence=0.99,
+                    provider='google_places',
+                    source_type='search',
+                    formatted_address=result.get('formatted_address', ''),
+                    accuracy_radius=100
+                )
+                
+                # Extract address components
+                for component in components:
+                    types = component.get('types', [])
+                    long_name = component.get('long_name', '')
+                    short_name = component.get('short_name', '')
+                    
+                    if 'street_number' in types:
+                        location_result.house_number = long_name
+                    elif 'route' in types:
+                        location_result.road = long_name
+                    elif 'neighborhood' in types:
+                        location_result.neighbourhood = long_name
+                    elif 'sublocality' in types:
+                        location_result.suburb = long_name
+                    elif 'locality' in types:
+                        location_result.city = long_name
+                    elif 'administrative_area_level_1' in types:
+                        location_result.state = long_name
+                    elif 'country' in types:
+                        location_result.country = long_name
+                        location_result.country_code = short_name
+                    elif 'postal_code' in types:
+                        location_result.zipcode = long_name
+                
+                return location_result
+
+    async def _get_location_from_nominatim_place_id(self, place_id: str) -> LocationResult:
+        """Get location details from Nominatim place ID"""
+        
+        url = f"https://nominatim.openstreetmap.org/details"
+        params = {
+            'place_id': place_id,
+            'format': 'json',
+            'addressdetails': 1
+        }
+        headers = {'User-Agent': 'SkyVibeWeatherApp/4.0'}
+        
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, params=params, headers=headers, timeout=5) as response:
+                if response.status != 200:
+                    # Try alternative endpoint
+                    lookup_url = "https://nominatim.openstreetmap.org/lookup"
+                    lookup_params = {
+                        'osm_ids': f"N{place_id}",
+                        'format': 'json',
+                        'addressdetails': 1
+                    }
+                    
+                    async with session.get(lookup_url, params=lookup_params, headers=headers, timeout=5) as lookup_response:
+                        if lookup_response.status != 200:
+                            raise LocationServiceError(f"Nominatim API error: {lookup_response.status}")
+                        
+                        data = await lookup_response.json()
+                        if not data:
+                            raise LocationServiceError("Place not found")
+                        
+                        item = data[0]
+                else:
+                    item = await response.json()
+                
+                address = item.get('address', {})
+                
+                return LocationResult(
+                    lat=float(item.get('lat', 0)),
+                    lon=float(item.get('lon', 0)),
+                    accuracy=0.95,
+                    confidence=0.95,
+                    provider='nominatim',
+                    source_type='search',
+                    formatted_address=item.get('display_name', ''),
+                    house_number=address.get('house_number', ''),
+                    road=address.get('road', ''),
+                    neighbourhood=address.get('neighbourhood', ''),
+                    suburb=address.get('suburb', ''),
+                    city=address.get('city') or address.get('town', ''),
+                    state=address.get('state', ''),
+                    country=address.get('country', ''),
+                    country_code=address.get('country_code', '').upper(),
+                    zipcode=address.get('postcode', ''),
+                    accuracy_radius=500
+                )
     
     async def _query_ip_api_com_enhanced(self, ip_address: str) -> LocationResult:
         url = f"http://ip-api.com/json/{ip_address}?fields=status,lat,lon,city,regionName,country,countryCode,zip,isp,org,as,timezone"

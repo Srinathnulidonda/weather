@@ -70,6 +70,7 @@ CACHE_TTLS = {
     'spotify': 3600,
     'activities': 1800,
     'ultra_weather': 900,
+    'location_search': 86400,
     'ultra_location': 7200
 }
 
@@ -690,6 +691,101 @@ def clean_expired_requests():
                    if current_time - timestamp > 30]
     for key in expired_keys:
         active_location_requests.pop(key, None)
+
+@app.route('/api/location/search', methods=['GET'])
+@limiter.limit("100 per hour")
+async def search_locations():
+    query = request.args.get('q', '').strip()
+    
+    if not query or len(query) < 2:
+        return jsonify({
+            'success': False,
+            'error': 'Query must be at least 2 characters',
+            'results': []
+        }), 400
+    
+    try:
+        # Check cache first
+        cache_key = generate_cache_key('location_search', query.lower())
+        cached_results = get_from_cache(cache_key, 'location_search')
+        
+        if cached_results:
+            logger.info(f"Using cached search results for: {query}")
+            return jsonify({
+                'success': True,
+                'query': query,
+                'results': cached_results,
+                'cache_hit': True,
+                'timestamp': datetime.utcnow().isoformat()
+            }), 200
+        
+        # Search for locations
+        results = await location_service.search_location(query)
+        
+        if not results:
+            return jsonify({
+                'success': True,
+                'query': query,
+                'results': [],
+                'message': 'No locations found',
+                'timestamp': datetime.utcnow().isoformat()
+            }), 200
+        
+        # Cache the results
+        set_cache(cache_key, results, 'location_search')
+        
+        return jsonify({
+            'success': True,
+            'query': query,
+            'results': results,
+            'cache_hit': False,
+            'timestamp': datetime.utcnow().isoformat()
+        }), 200
+        
+    except Exception as e:
+        logger.error(f"Location search error: {e}")
+        return jsonify({
+            'success': False,
+            'error': 'Search service unavailable',
+            'code': 'SEARCH_ERROR'
+        }), 503
+
+@app.route('/api/location/details', methods=['POST'])
+@limiter.limit("100 per hour")
+async def get_location_details():
+    data = request.get_json() or {}
+    place_id = data.get('place_id')
+    source = data.get('source', 'google')
+    
+    if not place_id:
+        return jsonify({
+            'success': False,
+            'error': 'Place ID required'
+        }), 400
+    
+    try:
+        # Get detailed location from place ID
+        location = await location_service.get_location_from_place_id(place_id, source)
+        
+        # Format the response
+        response = {
+            'success': True,
+            'location': location.__dict__,
+            'display_location': location_service.format_full_location(location),
+            'accuracy_score': f"{location.accuracy:.0%}",
+            'method': location.provider,
+            'timestamp': datetime.utcnow().isoformat()
+        }
+        
+        return jsonify(response), 200
+        
+    except Exception as e:
+        logger.error(f"Location details error: {e}")
+        return jsonify({
+            'success': False,
+            'error': 'Could not get location details',
+            'code': 'DETAILS_ERROR'
+        }), 503
 
 @app.route('/', methods=['GET'])
 def home():

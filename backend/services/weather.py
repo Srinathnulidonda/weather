@@ -1,4 +1,4 @@
-#backend/services/weather.py
+# backend/services/weather.py
 import os
 import requests
 import logging
@@ -71,6 +71,163 @@ class UltraWeatherService:
             'late_afternoon': (17, 19),
             'evening': (19, 22),
             'night': (22, 4)
+        }
+        
+        self.weather_recommendations = {
+            'Clear': {
+                'morning': {
+                    'activities': ['Jogging', 'Cycling', 'Outdoor yoga', 'Hiking'],
+                    'clothing': ['Light athletic wear', 'Sunglasses', 'Cap'],
+                    'health_tips': ['Apply sunscreen', 'Stay hydrated', 'Perfect for exercise']
+                },
+                'afternoon': {
+                    'activities': ['Swimming', 'Indoor activities', 'Shopping'],
+                    'clothing': ['Light clothing', 'Sun hat', 'UV protection'],
+                    'health_tips': ['Seek shade', 'Increase water intake', 'Avoid prolonged exposure']
+                },
+                'evening': {
+                    'activities': ['Walking', 'Outdoor dining', 'Social gatherings'],
+                    'clothing': ['Light layers', 'Comfortable wear'],
+                    'health_tips': ['Perfect time for exercise', 'Stay visible']
+                },
+                'night': {
+                    'activities': ['Stargazing', 'Peaceful walks', 'Reading'],
+                    'clothing': ['Light jacket', 'Comfortable wear'],
+                    'health_tips': ['Use proper lighting', 'Dress for temperature drop']
+                }
+            },
+            'Clouds': {
+                'morning': {
+                    'activities': ['Running', 'Cycling', 'Any outdoor activity'],
+                    'clothing': ['Comfortable layers', 'Athletic wear'],
+                    'health_tips': ['Perfect conditions for exercise']
+                },
+                'afternoon': {
+                    'activities': ['Outdoor exploration', 'Sports', 'Walking'],
+                    'clothing': ['Casual layers', 'Comfortable clothing'],
+                    'health_tips': ['Ideal conditions for activities']
+                },
+                'evening': {
+                    'activities': ['Social gatherings', 'Walking', 'Events'],
+                    'clothing': ['Light layers', 'Casual options'],
+                    'health_tips': ['Excellent conditions']
+                },
+                'night': {
+                    'activities': ['Indoor activities', 'Relaxation'],
+                    'clothing': ['Comfortable layers', 'Cozy wear'],
+                    'health_tips': ['Good sleeping conditions']
+                }
+            },
+            'Rain': {
+                'morning': {
+                    'activities': ['Indoor exercise', 'Café visits', 'Reading'],
+                    'clothing': ['Waterproof jacket', 'Rain boots', 'Umbrella'],
+                    'health_tips': ['Stay dry', 'Watch for slippery surfaces']
+                },
+                'afternoon': {
+                    'activities': ['Indoor shopping', 'Museums', 'Movies'],
+                    'clothing': ['Rain gear', 'Waterproof clothing'],
+                    'health_tips': ['Drive carefully', 'Stay warm']
+                },
+                'evening': {
+                    'activities': ['Home activities', 'Reading', 'Movies'],
+                    'clothing': ['Cozy indoor wear', 'Warm layers'],
+                    'health_tips': ['Stay indoors for comfort']
+                },
+                'night': {
+                    'activities': ['Sleeping', 'Reading', 'Relaxation'],
+                    'clothing': ['Cozy pajamas', 'Warm layers'],
+                    'health_tips': ['Perfect sleeping weather']
+                }
+            },
+            'Drizzle': {
+                'morning': {
+                    'activities': ['Light indoor activities', 'Coffee shops'],
+                    'clothing': ['Light rain jacket', 'Comfortable shoes'],
+                    'health_tips': ['Light protection needed']
+                },
+                'afternoon': {
+                    'activities': ['Indoor venues', 'Shopping', 'Museums'],
+                    'clothing': ['Light layers', 'Water-resistant clothing'],
+                    'health_tips': ['Stay comfortable']
+                },
+                'evening': {
+                    'activities': ['Indoor dining', 'Home activities'],
+                    'clothing': ['Comfortable indoor wear'],
+                    'health_tips': ['Cozy evening indoors']
+                },
+                'night': {
+                    'activities': ['Rest', 'Sleep', 'Relaxation'],
+                    'clothing': ['Comfortable sleepwear'],
+                    'health_tips': ['Good for sleep']
+                }
+            },
+            'Snow': {
+                'morning': {
+                    'activities': ['Snow sports', 'Indoor activities'],
+                    'clothing': ['Heavy winter gear', 'Waterproof boots'],
+                    'health_tips': ['Layer properly', 'Stay warm']
+                },
+                'afternoon': {
+                    'activities': ['Indoor activities', 'Hot beverages'],
+                    'clothing': ['Winter coat', 'Warm layers'],
+                    'health_tips': ['Limit exposure', 'Stay warm']
+                },
+                'evening': {
+                    'activities': ['Indoor activities', 'Cozy home time'],
+                    'clothing': ['Warm indoor clothing'],
+                    'health_tips': ['Stay indoors']
+                },
+                'night': {
+                    'activities': ['Sleep', 'Rest'],
+                    'clothing': ['Warm pajamas', 'Extra blankets'],
+                    'health_tips': ['Keep warm']
+                }
+            },
+            'Thunderstorm': {
+                'morning': {
+                    'activities': ['Stay indoors', 'Postpone outdoor plans'],
+                    'clothing': ['Indoor comfortable wear'],
+                    'health_tips': ['Avoid outdoor activities', 'Stay safe']
+                },
+                'afternoon': {
+                    'activities': ['Indoor only', 'Safe shelter'],
+                    'clothing': ['Comfortable indoor clothing'],
+                    'health_tips': ['Stay away from windows', 'Unplug electronics']
+                },
+                'evening': {
+                    'activities': ['Indoor activities only'],
+                    'clothing': ['Comfortable wear'],
+                    'health_tips': ['Monitor weather updates']
+                },
+                'night': {
+                    'activities': ['Sleep', 'Stay indoors'],
+                    'clothing': ['Comfortable sleepwear'],
+                    'health_tips': ['Stay safe indoors']
+                }
+            },
+            'Mist': {
+                'morning': {
+                    'activities': ['Light activities', 'Short walks'],
+                    'clothing': ['Visibility gear', 'Light layers'],
+                    'health_tips': ['Drive carefully', 'Use lights']
+                },
+                'afternoon': {
+                    'activities': ['Indoor preferred', 'Short trips'],
+                    'clothing': ['Comfortable layers'],
+                    'health_tips': ['Be visible']
+                },
+                'evening': {
+                    'activities': ['Indoor activities'],
+                    'clothing': ['Warm layers'],
+                    'health_tips': ['Limited visibility']
+                },
+                'night': {
+                    'activities': ['Stay indoors'],
+                    'clothing': ['Comfortable wear'],
+                    'health_tips': ['Avoid travel']
+                }
+            }
         }
         
         self.ultra_recommendations = {
@@ -732,7 +889,13 @@ class UltraWeatherService:
         
         async with aiohttp.ClientSession() as session:
             async with session.get(url, params=params, timeout=10) as response:
+                if response.status != 200:
+                    raise Exception(f"AccuWeather API error: {response.status}")
+                
                 data = await response.json()
+                
+                if not data or not isinstance(data, list) or len(data) == 0:
+                    raise Exception("Invalid AccuWeather response")
                 
                 current = data[0]
                 temperature = current['Temperature']['Metric']['Value']
@@ -766,7 +929,14 @@ class UltraWeatherService:
         
         async with aiohttp.ClientSession() as session:
             async with session.get(url, params=params, timeout=10) as response:
+                if response.status != 200:
+                    raise Exception(f"AccuWeather location API error: {response.status}")
+                
                 data = await response.json()
+                
+                if not data or 'Key' not in data:
+                    raise Exception("Invalid AccuWeather location response")
+                
                 return data['Key']
     
     async def _get_accuweather_air_quality(self, lat: float, lon: float) -> AirQualityData:
@@ -777,7 +947,13 @@ class UltraWeatherService:
         
         async with aiohttp.ClientSession() as session:
             async with session.get(url, params=params, timeout=10) as response:
+                if response.status != 200:
+                    raise Exception(f"AccuWeather air quality API error: {response.status}")
+                
                 data = await response.json()
+                
+                if not data or not isinstance(data, list) or len(data) == 0:
+                    raise Exception("Invalid AccuWeather air quality response")
                 
                 aqi = data[0]['AirQualityIndex']
                 level_map = {
@@ -819,7 +995,13 @@ class UltraWeatherService:
         
         async with aiohttp.ClientSession() as session:
             async with session.get(url, params=params, timeout=15) as response:
+                if response.status != 200:
+                    raise Exception(f"AccuWeather forecast API error: {response.status}")
+                
                 data = await response.json()
+                
+                if not data or 'DailyForecasts' not in data:
+                    raise Exception("Invalid AccuWeather forecast response")
                 
                 forecast = []
                 for day_data in data['DailyForecasts']:
@@ -847,16 +1029,22 @@ class UltraWeatherService:
                 return forecast
     
     async def _get_tomorrow_current(self, lat: float, lon: float) -> WeatherData:
-        url = f"https://api.tomorrow.io/v4/weather/realtime"
+        url = "https://api.tomorrow.io/v4/weather/realtime"
         params = {
             'location': f"{lat},{lon}",
             'apikey': self.tomorrow_api_key,
-            'fields': 'temperature,temperatureApparent,humidity,pressureSeaLevel,windSpeed,windDirection,visibility,uvIndex,cloudCover,weatherCode'
+            'fields': 'temperature,temperatureApparent,humidity,pressureSeaLevel,windSpeed,windDirection,visibility,uvIndex,cloudCover,weatherCode,precipitationIntensity,dewPoint'
         }
         
         async with aiohttp.ClientSession() as session:
             async with session.get(url, params=params, timeout=10) as response:
+                if response.status != 200:
+                    raise Exception(f"Tomorrow.io API error: {response.status}")
+                
                 data = await response.json()
+                
+                if 'data' not in data or 'values' not in data.get('data', {}):
+                    raise Exception("Invalid Tomorrow.io response structure")
                 
                 values = data['data']['values']
                 weather_code = values.get('weatherCode', 1000)
@@ -875,11 +1063,13 @@ class UltraWeatherService:
                     condition=condition,
                     description=description,
                     icon=icon,
-                    timestamp=datetime.fromisoformat(data['data']['time'].replace('Z', '+00:00'))
+                    timestamp=datetime.fromisoformat(data['data']['time'].replace('Z', '+00:00')),
+                    precipitation=values.get('precipitationIntensity', 0),
+                    dew_point=values.get('dewPoint', 0)
                 )
     
     async def _get_tomorrow_air_quality(self, lat: float, lon: float) -> AirQualityData:
-        url = f"https://api.tomorrow.io/v4/weather/realtime"
+        url = "https://api.tomorrow.io/v4/weather/realtime"
         params = {
             'location': f"{lat},{lon}",
             'apikey': self.tomorrow_api_key,
@@ -888,7 +1078,13 @@ class UltraWeatherService:
         
         async with aiohttp.ClientSession() as session:
             async with session.get(url, params=params, timeout=10) as response:
+                if response.status != 200:
+                    raise Exception(f"Tomorrow.io air quality API error: {response.status}")
+                
                 data = await response.json()
+                
+                if 'data' not in data or 'values' not in data.get('data', {}):
+                    raise Exception("Invalid Tomorrow.io air quality response")
                 
                 values = data['data']['values']
                 epa_index = values.get('epaIndex', 1)
@@ -914,7 +1110,7 @@ class UltraWeatherService:
                 )
     
     async def _get_tomorrow_health_insights(self, lat: float, lon: float) -> HealthInsights:
-        url = f"https://api.tomorrow.io/v4/weather/realtime"
+        url = "https://api.tomorrow.io/v4/weather/realtime"
         params = {
             'location': f"{lat},{lon}",
             'apikey': self.tomorrow_api_key,
@@ -923,7 +1119,13 @@ class UltraWeatherService:
         
         async with aiohttp.ClientSession() as session:
             async with session.get(url, params=params, timeout=10) as response:
+                if response.status != 200:
+                    raise Exception(f"Tomorrow.io health insights API error: {response.status}")
+                
                 data = await response.json()
+                
+                if 'data' not in data or 'values' not in data.get('data', {}):
+                    raise Exception("Invalid Tomorrow.io health insights response")
                 
                 values = data['data']['values']
                 temp = values.get('temperature', 20)
@@ -963,20 +1165,27 @@ class UltraWeatherService:
                 )
     
     async def _get_tomorrow_forecast(self, lat: float, lon: float, days: int) -> List[Dict]:
-        url = f"https://api.tomorrow.io/v4/weather/forecast"
+        url = "https://api.tomorrow.io/v4/weather/forecast"
         params = {
             'location': f"{lat},{lon}",
             'apikey': self.tomorrow_api_key,
-            'timesteps': '1d',
-            'fields': 'temperatureMin,temperatureMax,temperatureAvg,humidity,pressureSeaLevel,windSpeed,uvIndex,weatherCode'
+            'fields': 'temperature,temperatureMin,temperatureMax,humidity,pressureSeaLevel,windSpeed,uvIndex,weatherCode,precipitationProbability'
         }
         
         async with aiohttp.ClientSession() as session:
             async with session.get(url, params=params, timeout=15) as response:
+                if response.status != 200:
+                    raise Exception(f"Tomorrow.io forecast API error: {response.status}")
+                
                 data = await response.json()
                 
+                if 'timelines' not in data or 'daily' not in data.get('timelines', {}):
+                    raise Exception("Invalid Tomorrow.io forecast response")
+                
                 forecast = []
-                for item in data['timelines']['daily'][:days]:
+                daily_data = data['timelines']['daily']
+                
+                for i, item in enumerate(daily_data[:days]):
                     values = item['values']
                     time_str = item['time']
                     date = datetime.fromisoformat(time_str.replace('Z', '+00:00')).date()
@@ -990,7 +1199,7 @@ class UltraWeatherService:
                         'temperature': {
                             'min': round(values.get('temperatureMin', 0), 1),
                             'max': round(values.get('temperatureMax', 0), 1),
-                            'avg': round(values.get('temperatureAvg', 0), 1)
+                            'avg': round(values.get('temperature', 0), 1)
                         },
                         'condition': condition,
                         'description': description,
@@ -998,7 +1207,8 @@ class UltraWeatherService:
                         'humidity': values.get('humidity', 0),
                         'pressure': values.get('pressureSeaLevel', 0),
                         'wind_speed': values.get('windSpeed', 0),
-                        'uv_index': values.get('uvIndex', 0)
+                        'uv_index': values.get('uvIndex', 0),
+                        'precipitation_probability': values.get('precipitationProbability', 0)
                     })
                 
                 return forecast
@@ -1008,12 +1218,18 @@ class UltraWeatherService:
         params = {
             'key': self.visual_crossing_api_key,
             'include': 'current',
-            'elements': 'temp,feelslike,humidity,pressure,windspeed,winddir,visibility,uvindex,cloudcover,conditions,icon'
+            'elements': 'temp,feelslike,humidity,pressure,windspeed,winddir,visibility,uvindex,cloudcover,conditions,icon,precip,dew'
         }
         
         async with aiohttp.ClientSession() as session:
             async with session.get(url, params=params, timeout=10) as response:
+                if response.status != 200:
+                    raise Exception(f"Visual Crossing API error: {response.status}")
+                
                 data = await response.json()
+                
+                if 'currentConditions' not in data:
+                    raise Exception("Invalid Visual Crossing response")
                 
                 current = data['currentConditions']
                 
@@ -1030,22 +1246,33 @@ class UltraWeatherService:
                     condition=self._map_visual_crossing_condition(current.get('conditions', '')),
                     description=current.get('conditions', ''),
                     icon=current.get('icon', ''),
-                    timestamp=datetime.now()
+                    timestamp=datetime.now(),
+                    precipitation=current.get('precip', 0),
+                    dew_point=current.get('dew', 0)
                 )
     
     async def _get_visual_crossing_forecast(self, lat: float, lon: float, days: int) -> List[Dict]:
         url = f"https://weather.visualcrossing.com/VisualCrossingWebServices/rest/services/timeline/{lat},{lon}"
         params = {
             'key': self.visual_crossing_api_key,
-            'elements': 'tempmin,tempmax,temp,humidity,pressure,windspeed,uvindex,conditions,icon'
+            'elements': 'tempmin,tempmax,temp,humidity,pressure,windspeed,uvindex,conditions,icon,precipprob'
         }
         
         async with aiohttp.ClientSession() as session:
             async with session.get(url, params=params, timeout=15) as response:
+                if response.status != 200:
+                    raise Exception(f"Visual Crossing forecast API error: {response.status}")
+                
                 data = await response.json()
+                
+                if 'days' not in data:
+                    raise Exception("Invalid Visual Crossing forecast response")
                 
                 forecast = []
                 for item in data['days'][:days]:
+                    if 'datetime' not in item:
+                        continue
+                        
                     date = datetime.strptime(item['datetime'], '%Y-%m-%d').date()
                     
                     forecast.append({
@@ -1062,13 +1289,14 @@ class UltraWeatherService:
                         'humidity': item.get('humidity', 0),
                         'pressure': item.get('pressure', 0),
                         'wind_speed': item.get('windspeed', 0),
-                        'uv_index': item.get('uvindex', 0)
+                        'uv_index': item.get('uvindex', 0),
+                        'precipitation_probability': item.get('precipprob', 0)
                     })
                 
                 return forecast
     
     async def _get_openweather_current(self, lat: float, lon: float) -> WeatherData:
-        url = f"https://api.openweathermap.org/data/2.5/weather"
+        url = "https://api.openweathermap.org/data/2.5/weather"
         params = {
             'lat': lat,
             'lon': lon,
@@ -1078,6 +1306,9 @@ class UltraWeatherService:
         
         async with aiohttp.ClientSession() as session:
             async with session.get(url, params=params, timeout=10) as response:
+                if response.status != 200:
+                    raise Exception(f"OpenWeather API error: {response.status}")
+                
                 data = await response.json()
                 
                 main = data['main']
@@ -1101,7 +1332,7 @@ class UltraWeatherService:
                 )
     
     async def _get_openweather_air_quality(self, lat: float, lon: float) -> AirQualityData:
-        url = f"http://api.openweathermap.org/data/2.5/air_pollution"
+        url = "http://api.openweathermap.org/data/2.5/air_pollution"
         params = {
             'lat': lat,
             'lon': lon,
@@ -1110,7 +1341,13 @@ class UltraWeatherService:
         
         async with aiohttp.ClientSession() as session:
             async with session.get(url, params=params, timeout=10) as response:
+                if response.status != 200:
+                    raise Exception(f"OpenWeather air quality API error: {response.status}")
+                
                 data = await response.json()
+                
+                if 'list' not in data or len(data['list']) == 0:
+                    raise Exception("Invalid OpenWeather air quality response")
                 
                 pollution_data = data['list'][0]
                 main = pollution_data['main']
@@ -1130,7 +1367,7 @@ class UltraWeatherService:
                 )
     
     async def _get_openweather_forecast(self, lat: float, lon: float, days: int) -> List[Dict]:
-        url = f"https://api.openweathermap.org/data/2.5/forecast"
+        url = "https://api.openweathermap.org/data/2.5/forecast"
         params = {
             'lat': lat,
             'lon': lon,
@@ -1140,7 +1377,13 @@ class UltraWeatherService:
         
         async with aiohttp.ClientSession() as session:
             async with session.get(url, params=params, timeout=10) as response:
+                if response.status != 200:
+                    raise Exception(f"OpenWeather forecast API error: {response.status}")
+                
                 data = await response.json()
+                
+                if 'list' not in data:
+                    raise Exception("Invalid OpenWeather forecast response")
                 
                 daily_data = {}
                 for item in data['list']:

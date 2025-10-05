@@ -86,13 +86,42 @@ class UltraAccurateLocationService:
     async def get_ultra_accurate_location(self, ip_address: Optional[str] = None, 
                                         session_id: Optional[str] = None,
                                         browser_location: Optional[Dict] = None) -> LocationResult:
-        best_location = None
         
         if browser_location and self._validate_browser_location(browser_location):
             logger.info("Using browser GPS location (highest accuracy)")
-            best_location = await self._process_browser_location(browser_location)
-            if best_location.accuracy >= 0.98:
-                return best_location
+            lat = float(browser_location['latitude'])
+            lon = float(browser_location['longitude'])
+            accuracy_meters = browser_location.get('accuracy', 100)
+            
+            if self.google_maps_key:
+                try:
+                    enhanced = await self._reverse_geocode_google(lat, lon)
+                    enhanced.accuracy = min(0.99, 1 - (accuracy_meters / 10000))
+                    enhanced.confidence = 0.99
+                    enhanced.source_type = "gps"
+                    enhanced.accuracy_radius = accuracy_meters
+                    logger.info(f"GPS location enhanced with Google Maps: {enhanced.city}, {enhanced.state}")
+                    
+                    if session_id and self.redis_client:
+                        self._store_session_location(session_id, enhanced)
+                    
+                    return enhanced
+                except Exception as e:
+                    logger.warning(f"Google Maps enhancement failed: {e}")
+            
+            try:
+                enhanced = await self._reverse_geocode_nominatim_coords(lat, lon)
+                enhanced.accuracy = min(0.95, 1 - (accuracy_meters / 10000))
+                enhanced.confidence = 0.95
+                enhanced.source_type = "gps"
+                enhanced.accuracy_radius = accuracy_meters
+                
+                if session_id and self.redis_client:
+                    self._store_session_location(session_id, enhanced)
+                
+                return enhanced
+            except Exception as e:
+                logger.warning(f"Nominatim enhancement failed: {e}")
         
         if session_id and self.redis_client:
             cached = self._get_session_location(session_id)
@@ -109,9 +138,7 @@ class UltraAccurateLocationService:
             raise LocationServiceError("All location providers failed")
         
         consensus_location = await self._calculate_ultra_consensus(provider_results, ip_address)
-        
         enhanced_location = await self._ultra_enhance_location(consensus_location)
-        
         final_location = await self._validate_and_refine(enhanced_location, ip_address)
         
         if session_id and self.redis_client and final_location.accuracy >= 0.85:

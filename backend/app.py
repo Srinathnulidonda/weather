@@ -1,22 +1,24 @@
 #backend/app.py
 import os
-from dotenv import load_dotenv
-
-load_dotenv()
-
-import requests
-import logging
-import time
-import random
+import asyncio
+import uuid
 import hashlib
-from datetime import datetime, timezone
-from typing import Dict, Optional, Tuple, Callable
-from functools import wraps
-from flask import Flask, request, jsonify
+import time
+import logging
+from datetime import datetime, timedelta
+from flask import Flask, request, jsonify, make_response
 from flask_cors import CORS
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
+import requests
+import random
 import base64
+import json
+import redis
+from urllib.parse import urlparse
+from functools import wraps
+from services.location import location_service, LocationServiceError
+from services.weather import weather_service
 
 app = Flask(__name__)
 CORS(app, resources={r"/api/*": {"origins": "*", "supports_credentials": True}})
@@ -27,754 +29,592 @@ app.config['JSON_SORT_KEYS'] = False
 limiter = Limiter(
     app=app,
     key_func=get_remote_address,
-    default_limits=["1000 per day", "200 per hour"],
+    default_limits=["3000 per day", "500 per hour"],
     storage_uri="memory://"
 )
 
-# Fixed logging configuration for Windows Unicode support
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler('weather_api.log', encoding='utf-8')
+        logging.StreamHandler()
     ]
 )
 logger = logging.getLogger(__name__)
 
-OPENWEATHER_API_KEY = os.getenv('OPENWEATHER_API_KEY')
+try:
+    redis_url = os.getenv('REDIS_URL')
+    if redis_url:
+        redis_client = redis.from_url(redis_url, decode_responses=True, socket_connect_timeout=5, socket_timeout=5)
+    else:
+        redis_client = redis.Redis(
+            host=os.getenv('REDIS_HOST', 'localhost'),
+            port=int(os.getenv('REDIS_PORT', 6379)),
+            db=0,
+            decode_responses=True,
+            socket_connect_timeout=5,
+            socket_timeout=5
+        )
+    redis_client.ping()
+    logger.info("Redis connected successfully")
+except Exception as e:
+    redis_client = None
+    logger.warning(f"Redis not available: {e}, using memory cache")
+
+CACHE_TTLS = {
+    'weather_current': 600,
+    'weather_forecast': 1800,
+    'location_ip': 3600,
+    'location_coords': 7200,
+    'insights': 1800,
+    'spotify': 3600,
+    'activities': 1800
+}
+
+SPATIAL_THRESHOLD = 0.01
+TEMPORAL_THRESHOLD = 300
+
+request_cache = {}
+active_location_requests = {}
+
 SPOTIFY_CLIENT_ID = os.getenv('SPOTIFY_CLIENT_ID')
 SPOTIFY_CLIENT_SECRET = os.getenv('SPOTIFY_CLIENT_SECRET')
-IPGEOLOCATION_API_KEY = os.getenv('IPGEOLOCATION_API_KEY', '')
-GEOCODE_API_KEY = os.getenv('GEOCODE_API_KEY', '')
-GOOGLE_MAPS_API_KEY = os.getenv('GOOGLE_MAPS_API_KEY', '')
-
-if not OPENWEATHER_API_KEY:
-    logger.critical("OPENWEATHER_API_KEY not configured!")
-    raise RuntimeError("OPENWEATHER_API_KEY environment variable is required")
-
-if not GOOGLE_MAPS_API_KEY:
-    logger.warning("GOOGLE_MAPS_API_KEY not configured! Falling back to other providers.")
-
-class LocationServiceError(Exception):
-    pass
-
-class LocationService:
-    CACHE_DURATION = 300
-    REQUEST_TIMEOUT = 15
-    MAX_RETRIES = 2
-    RETRY_DELAY = 1
-    
-    def __init__(self, openweather_api_key: Optional[str] = None, 
-                 geocode_api_key: Optional[str] = None,
-                 ipgeolocation_api_key: Optional[str] = None,
-                 google_maps_api_key: Optional[str] = None):
-        self.openweather_api_key = openweather_api_key
-        self.geocode_api_key = geocode_api_key
-        self.ipgeolocation_api_key = ipgeolocation_api_key
-        self.google_maps_api_key = google_maps_api_key
-        self._cache: Dict[str, Tuple[Dict, float]] = {}
-        self._stats = {
-            'total_requests': 0,
-            'cache_hits': 0,
-            'successful_requests': 0,
-            'failed_requests': 0,
-            'google_api_calls': 0
-        }
-        if google_maps_api_key:
-            logger.info("LocationService initialized - GOOGLE MAPS MODE (100% Accuracy)")
-        else:
-            logger.info("LocationService initialized - High Accuracy Mode")
-    
-    def get_location_from_coordinates(self, latitude: float, longitude: float, use_cache: bool = False) -> Dict:
-        self._stats['total_requests'] += 1
-        
-        if not self._validate_coordinates(latitude, longitude):
-            raise LocationServiceError(f"Invalid coordinates: lat={latitude}, lon={longitude}")
-        
-        if use_cache:
-            cache_key = self._generate_cache_key('coords', latitude, longitude)
-            cached_data = self._get_from_cache(cache_key)
-            if cached_data:
-                self._stats['cache_hits'] += 1
-                logger.info(f"Cache hit for coordinates: {latitude}, {longitude}")
-                return cached_data
-        
-        logger.info(f"Fetching fresh location data for coordinates: {latitude}, {longitude}")
-        
-        if self.google_maps_api_key:
-            try:
-                logger.info("Attempting Google Geocoding API (Priority #1 - 100% Accurate)...")
-                location_data = self._reverse_geocode_google(latitude, longitude)
-                
-                if location_data and self._validate_location_data(location_data):
-                    location_data['source'] = 'Google Geocoding API'
-                    location_data['method'] = 'gps-coordinates'
-                    location_data['accuracy'] = '100% - Premium'
-                    location_data['timestamp'] = datetime.now(timezone.utc).isoformat()
-                    
-                    if use_cache:
-                        cache_key = self._generate_cache_key('coords', latitude, longitude)
-                        self._add_to_cache(cache_key, location_data)
-                    
-                    self._stats['successful_requests'] += 1
-                    self._stats['google_api_calls'] += 1
-                    
-                    full_location = self._format_full_location(location_data)
-                    logger.info(f"SUCCESS: Google API returned: {full_location}")
-                    logger.info(f"Details - Road: {location_data.get('road')}, Suburb: {location_data.get('suburb')}, City: {location_data.get('city')}")
-                    
-                    return location_data
-            except Exception as e:
-                logger.warning(f"Google Geocoding API failed: {str(e)}")
-        
-        providers = [
-            ('Nominatim-OSM', self._reverse_geocode_nominatim),
-            ('BigDataCloud', self._reverse_geocode_bigdatacloud),
-            ('LocationIQ', self._reverse_geocode_locationiq),
-        ]
-        
-        last_error = None
-        
-        for provider_name, provider_func in providers:
-            try:
-                logger.info(f"Trying fallback: {provider_name}...")
-                location_data = provider_func(latitude, longitude)
-                
-                if location_data and self._validate_location_data(location_data):
-                    location_data['source'] = provider_name
-                    location_data['method'] = 'gps-coordinates'
-                    location_data['accuracy'] = 'high'
-                    location_data['timestamp'] = datetime.now(timezone.utc).isoformat()
-                    
-                    if use_cache:
-                        cache_key = self._generate_cache_key('coords', latitude, longitude)
-                        self._add_to_cache(cache_key, location_data)
-                    
-                    self._stats['successful_requests'] += 1
-                    
-                    full_location = self._format_full_location(location_data)
-                    logger.info(f"SUCCESS: {provider_name} returned: {full_location}")
-                    
-                    return location_data
-                    
-            except Exception as e:
-                last_error = e
-                logger.warning(f"{provider_name} failed: {str(e)}")
-                continue
-        
-        self._stats['failed_requests'] += 1
-        error_msg = f"All reverse geocoding providers failed. Last error: {str(last_error)}"
-        logger.error(error_msg)
-        raise LocationServiceError(error_msg)
-    
-    def _reverse_geocode_google(self, lat: float, lon: float) -> Dict:
-        url = f"https://maps.googleapis.com/maps/api/geocode/json?latlng={lat},{lon}&key={self.google_maps_api_key}&result_type=street_address|route|neighborhood|locality|sublocality"
-        
-        headers = {
-            'Accept': 'application/json'
-        }
-        
-        response = requests.get(url, headers=headers, timeout=self.REQUEST_TIMEOUT)
-        response.raise_for_status()
-        data = response.json()
-        
-        if data.get('status') != 'OK':
-            raise LocationServiceError(f"Google API error: {data.get('status')} - {data.get('error_message', 'Unknown error')}")
-        
-        if not data.get('results'):
-            raise LocationServiceError("No results from Google Geocoding API")
-        
-        result = data['results'][0]
-        address_components = result.get('address_components', [])
-        
-        location_data = {
-            'road': '',
-            'house_number': '',
-            'suburb': '',
-            'neighbourhood': '',
-            'locality': '',
-            'city': '',
-            'district': '',
-            'state': '',
-            'country': '',
-            'country_code': '',
-            'zipcode': '',
-            'lat': lat,
-            'lon': lon,
-            'formatted_address': result.get('formatted_address', ''),
-            'place_id': result.get('place_id', '')
-        }
-        
-        for component in address_components:
-            types = component.get('types', [])
-            long_name = component.get('long_name', '')
-            short_name = component.get('short_name', '')
-            
-            if 'street_number' in types:
-                location_data['house_number'] = long_name
-            elif 'route' in types:
-                location_data['road'] = long_name
-            elif 'neighborhood' in types:
-                location_data['neighbourhood'] = long_name
-            elif 'sublocality' in types or 'sublocality_level_1' in types:
-                location_data['suburb'] = long_name
-            elif 'sublocality_level_2' in types and not location_data['neighbourhood']:
-                location_data['neighbourhood'] = long_name
-            elif 'locality' in types:
-                location_data['city'] = long_name
-                location_data['locality'] = long_name
-            elif 'administrative_area_level_2' in types:
-                location_data['district'] = long_name
-            elif 'administrative_area_level_1' in types:
-                location_data['state'] = long_name
-            elif 'country' in types:
-                location_data['country'] = long_name
-                location_data['country_code'] = short_name
-            elif 'postal_code' in types:
-                location_data['zipcode'] = long_name
-        
-        if not location_data['city'] and location_data['district']:
-            location_data['city'] = location_data['district']
-        
-        if not location_data['locality']:
-            location_data['locality'] = location_data.get('suburb') or location_data.get('neighbourhood') or ''
-        
-        logger.info(f"Google API parsed: road={location_data['road']}, suburb={location_data['suburb']}, neighbourhood={location_data['neighbourhood']}, city={location_data['city']}")
-        
-        if not location_data['city'] and not location_data['suburb'] and not location_data['locality']:
-            raise LocationServiceError("Insufficient location data from Google API")
-        
-        return location_data
-    
-    def _format_full_location(self, location_data: Dict) -> str:
-        parts = []
-        
-        if location_data.get('house_number') and location_data.get('road'):
-            parts.append(f"{location_data['house_number']} {location_data['road']}")
-        elif location_data.get('road'):
-            parts.append(location_data['road'])
-        
-        if location_data.get('suburb'):
-            parts.append(location_data['suburb'])
-        elif location_data.get('neighbourhood'):
-            parts.append(location_data['neighbourhood'])
-        elif location_data.get('locality') and location_data.get('locality') != location_data.get('city'):
-            parts.append(location_data['locality'])
-        
-        if location_data.get('city') and location_data.get('city') not in parts:
-            parts.append(location_data['city'])
-        
-        if location_data.get('state') and location_data.get('state') not in parts:
-            parts.append(location_data['state'])
-        
-        if location_data.get('country'):
-            parts.append(location_data['country'])
-        
-        return ', '.join(parts) if parts else location_data.get('formatted_address', 'Unknown Location')
-    
-    def _reverse_geocode_nominatim(self, lat: float, lon: float) -> Dict:
-        url = f"https://nominatim.openstreetmap.org/reverse?lat={lat}&lon={lon}&format=json&addressdetails=1&zoom=18&accept-language=en"
-        headers = {
-            'User-Agent': 'SkyVibeWeatherApp/2.0 (Production)',
-            'Accept-Language': 'en'
-        }
-        
-        time.sleep(1)
-        
-        response = requests.get(url, headers=headers, timeout=self.REQUEST_TIMEOUT)
-        response.raise_for_status()
-        data = response.json()
-        
-        address = data.get('address', {})
-        
-        road = address.get('road', '')
-        suburb = (address.get('suburb') or address.get('residential') or 
-                 address.get('neighbourhood') or address.get('quarter') or
-                 address.get('hamlet'))
-        
-        neighbourhood = (address.get('neighbourhood') or address.get('quarter') or
-                        address.get('suburb'))
-        
-        locality = (address.get('locality') or address.get('village') or 
-                   address.get('town') or address.get('hamlet'))
-        
-        city = (address.get('city') or address.get('municipality') or 
-               address.get('county') or locality or suburb)
-        
-        district = (address.get('state_district') or address.get('county'))
-        
-        state = address.get('state', '')
-        country = address.get('country', '')
-        
-        if not city and not suburb and not locality:
-            raise LocationServiceError("No valid location found in Nominatim response")
-        
-        return {
-            'road': road,
-            'suburb': suburb or '',
-            'neighbourhood': neighbourhood or '',
-            'locality': locality or '',
-            'city': city or 'Unknown',
-            'district': district or '',
-            'state': state,
-            'country': country,
-            'country_code': address.get('country_code', '').upper(),
-            'lat': lat,
-            'lon': lon,
-            'zipcode': address.get('postcode', ''),
-            'house_number': address.get('house_number', '')
-        }
-    
-    def _reverse_geocode_bigdatacloud(self, lat: float, lon: float) -> Dict:
-        url = f"https://api.bigdatacloud.net/data/reverse-geocode-client?latitude={lat}&longitude={lon}&localityLanguage=en"
-        
-        response = requests.get(url, timeout=self.REQUEST_TIMEOUT)
-        response.raise_for_status()
-        data = response.json()
-        
-        locality_info = data.get('localityInfo', {})
-        administrative = locality_info.get('administrative', [])
-        
-        suburb = ''
-        neighbourhood = ''
-        district = ''
-        
-        for admin in administrative:
-            order = admin.get('order', 0)
-            name = admin.get('name', '')
-            
-            if order == 8 and not suburb:
-                suburb = name
-            elif order == 7 and not neighbourhood:
-                neighbourhood = name
-            elif order == 6 and not neighbourhood:
-                neighbourhood = name
-            elif order == 5 and not district:
-                district = name
-        
-        city = (data.get('city') or data.get('locality') or 
-               data.get('principalSubdivision'))
-        
-        locality = data.get('locality', '')
-        
-        if not city and not suburb and not neighbourhood:
-            raise LocationServiceError("No valid location found in BigDataCloud response")
-        
-        return {
-            'road': '',
-            'suburb': suburb,
-            'neighbourhood': neighbourhood,
-            'locality': locality,
-            'city': city or 'Unknown',
-            'district': district or data.get('principalSubdivision', ''),
-            'state': data.get('principalSubdivision', ''),
-            'country': data.get('countryName', ''),
-            'country_code': data.get('countryCode', ''),
-            'lat': lat,
-            'lon': lon,
-            'zipcode': data.get('postcode', '')
-        }
-    
-    def _reverse_geocode_locationiq(self, lat: float, lon: float) -> Dict:
-        url = f"https://us1.locationiq.com/v1/reverse.php?key=pk.0f147952a41c555c5b3d3b5bc3a8d32b&lat={lat}&lon={lon}&format=json&zoom=18"
-        
-        try:
-            response = requests.get(url, timeout=self.REQUEST_TIMEOUT)
-            response.raise_for_status()
-            data = response.json()
-            
-            address = data.get('address', {})
-            
-            return {
-                'road': address.get('road', ''),
-                'suburb': address.get('suburb', ''),
-                'neighbourhood': address.get('neighbourhood', ''),
-                'locality': address.get('locality', ''),
-                'city': address.get('city') or address.get('town', ''),
-                'district': address.get('state_district', ''),
-                'state': address.get('state', ''),
-                'country': address.get('country', ''),
-                'country_code': address.get('country_code', '').upper(),
-                'lat': lat,
-                'lon': lon,
-                'zipcode': address.get('postcode', '')
-            }
-        except:
-            raise LocationServiceError("LocationIQ failed")
-    
-    def get_location_from_ip(self, ip_address: Optional[str] = None) -> Dict:
-        self._stats['total_requests'] += 1
-        
-        if ip_address and self._is_private_ip(ip_address):
-            logger.info(f"Private IP detected ({ip_address}), using auto-detection")
-            ip_address = None
-        
-        # Enhanced provider list with better accuracy providers first
-        providers = []
-        
-        # Premium providers first (if API keys available)
-        if self.ipgeolocation_api_key:
-            providers.append(('IPGeolocation.io', lambda: self._ipgeolocation_io(ip_address)))
-        
-        # Free providers with good accuracy
-        providers.extend([
-            ('IP-API.com', lambda: self._ip_api_com(ip_address)),
-            ('IPInfo.io', lambda: self._ipinfo_io(ip_address)),
-            ('IPAPI.co', lambda: self._ipapi_co(ip_address)),
-        ])
-        
-        last_error = None
-        best_result = None
-        best_accuracy = 0
-        
-        for provider_name, provider_func in providers:
-            try:
-                logger.info(f"Attempting IP geolocation with {provider_name}")
-                location_data = provider_func()
-                
-                if location_data and self._validate_location_data(location_data):
-                    # Calculate accuracy score based on detail level
-                    accuracy_score = self._calculate_location_accuracy(location_data)
-                    
-                    try:
-                        if self.google_maps_api_key:
-                            logger.info("Enhancing IP location with Google Geocoding API...")
-                            detailed_location = self._reverse_geocode_google(
-                                location_data['latitude'], 
-                                location_data['longitude']
-                            )
-                            self._stats['google_api_calls'] += 1
-                        else:
-                            detailed_location = self.get_location_from_coordinates(
-                                location_data['latitude'],
-                                location_data['longitude'],
-                                use_cache=False
-                            )
-                        
-                        location_data.update({
-                            'road': detailed_location.get('road', ''),
-                            'house_number': detailed_location.get('house_number', ''),
-                            'city': detailed_location.get('city', location_data.get('city')),
-                            'state': detailed_location.get('state', location_data.get('state')),
-                            'suburb': detailed_location.get('suburb', ''),
-                            'neighbourhood': detailed_location.get('neighbourhood', ''),
-                            'locality': detailed_location.get('locality', ''),
-                            'district': detailed_location.get('district', ''),
-                            'formatted_address': detailed_location.get('formatted_address', ''),
-                            'place_id': detailed_location.get('place_id', ''),
-                        })
-                        
-                        if self.google_maps_api_key:
-                            location_data['accuracy'] = '100% - Premium Enhanced'
-                            location_data['source'] = f"{provider_name} + Google Geocoding API"
-                        
-                    except Exception as e:
-                        logger.warning(f"Location enhancement failed: {e}")
-                    
-                    location_data['source'] = location_data.get('source', provider_name)
-                    location_data['method'] = 'ip-geolocation'
-                    location_data['accuracy'] = location_data.get('accuracy', f'medium ({accuracy_score}% confident)')
-                    location_data['timestamp'] = datetime.now(timezone.utc).isoformat()
-                    
-                    if 'latitude' in location_data:
-                        location_data['lat'] = location_data.pop('latitude')
-                    if 'longitude' in location_data:
-                        location_data['lon'] = location_data.pop('longitude')
-                    
-                    # Keep the best result based on accuracy
-                    if accuracy_score > best_accuracy:
-                        best_accuracy = accuracy_score
-                        best_result = location_data
-                    
-                    # If we get high accuracy result, use it immediately
-                    if accuracy_score >= 80:
-                        self._stats['successful_requests'] += 1
-                        full_location = self._format_full_location(location_data)
-                        logger.info(f"High accuracy result from {provider_name}: {full_location}")
-                        return location_data
-                    
-            except Exception as e:
-                last_error = e
-                logger.warning(f"{provider_name} failed: {str(e)}")
-                continue
-        
-        # Return best result if we have one
-        if best_result:
-            self._stats['successful_requests'] += 1
-            full_location = self._format_full_location(best_result)
-            logger.info(f"Best available result: {full_location} (Accuracy: {best_accuracy}%)")
-            logger.warning("IP geolocation may show ISP location instead of exact location. For best accuracy, use GPS coordinates.")
-            return best_result
-        
-        self._stats['failed_requests'] += 1
-        error_msg = f"All IP geolocation providers failed. Last error: {str(last_error)}"
-        logger.error(error_msg)
-        raise LocationServiceError(error_msg)
-    
-    def _calculate_location_accuracy(self, location_data: Dict) -> int:
-        """Calculate accuracy score based on available location details"""
-        score = 0
-        
-        # Base score for having coordinates
-        if location_data.get('latitude') and location_data.get('longitude'):
-            score += 20
-        
-        # City information
-        if location_data.get('city'):
-            score += 30
-        
-        # State/region information
-        if location_data.get('state') or location_data.get('region'):
-            score += 20
-        
-        # More detailed location info
-        if location_data.get('district'):
-            score += 10
-        if location_data.get('zipcode') or location_data.get('postal'):
-            score += 10
-        if location_data.get('timezone'):
-            score += 10
-        
-        return min(score, 100)
-    
-    def _ipgeolocation_io(self, ip_address: Optional[str]) -> Dict:
-        url = f"https://api.ipgeolocation.io/ipgeo?apiKey={self.ipgeolocation_api_key}"
-        if ip_address:
-            url += f"&ip={ip_address}"
-        
-        response = requests.get(url, timeout=self.REQUEST_TIMEOUT)
-        response.raise_for_status()
-        data = response.json()
-        
-        return {
-            'city': data.get('city'),
-            'district': data.get('district', ''),
-            'state': data.get('state_prov', ''),
-            'country': data.get('country_name'),
-            'latitude': float(data.get('latitude')),
-            'longitude': float(data.get('longitude')),
-            'timezone': data.get('time_zone', {}).get('name', 'UTC') if isinstance(data.get('time_zone'), dict) else 'UTC',
-            'zipcode': data.get('zipcode', '')
-        }
-    
-    def _ipinfo_io(self, ip_address: Optional[str]) -> Dict:
-        url = f"https://ipinfo.io/{ip_address}/json" if ip_address else "https://ipinfo.io/json"
-        
-        response = requests.get(url, timeout=self.REQUEST_TIMEOUT)
-        response.raise_for_status()
-        data = response.json()
-        
-        if 'loc' not in data:
-            raise LocationServiceError("No location data from IPInfo.io")
-        
-        loc = data['loc'].split(',')
-        
-        return {
-            'city': data.get('city'),
-            'state': data.get('region', ''),
-            'country': data.get('country'),
-            'latitude': float(loc[0]),
-            'longitude': float(loc[1]),
-            'timezone': data.get('timezone', 'UTC'),
-            'zipcode': data.get('postal', '')
-        }
-    
-    def _ipapi_co(self, ip_address: Optional[str]) -> Dict:
-        url = f"https://ipapi.co/{ip_address}/json/" if ip_address else "https://ipapi.co/json/"
-        
-        response = requests.get(url, timeout=self.REQUEST_TIMEOUT)
-        response.raise_for_status()
-        data = response.json()
-        
-        if 'error' in data:
-            raise LocationServiceError(f"IPAPI.co error: {data.get('reason')}")
-        
-        return {
-            'city': data.get('city'),
-            'state': data.get('region', ''),
-            'country': data.get('country_name'),
-            'latitude': float(data.get('latitude')),
-            'longitude': float(data.get('longitude')),
-            'timezone': data.get('timezone', 'UTC'),
-            'zipcode': data.get('postal', '')
-        }
-    
-    def _ip_api_com(self, ip_address: Optional[str]) -> Dict:
-        fields = "status,message,country,countryCode,region,regionName,city,district,zip,lat,lon,timezone"
-        url = f"http://ip-api.com/json/{ip_address}?fields={fields}" if ip_address else f"http://ip-api.com/json/?fields={fields}"
-        
-        response = requests.get(url, timeout=self.REQUEST_TIMEOUT)
-        response.raise_for_status()
-        data = response.json()
-        
-        if data.get('status') == 'fail':
-            raise LocationServiceError(f"IP-API.com error: {data.get('message')}")
-        
-        return {
-            'city': data.get('city'),
-            'district': data.get('district', ''),
-            'state': data.get('regionName', ''),
-            'country': data.get('country'),
-            'latitude': float(data.get('lat')),
-            'longitude': float(data.get('lon')),
-            'timezone': data.get('timezone', 'UTC'),
-            'zipcode': data.get('zip', '')
-        }
-    
-    def _validate_coordinates(self, lat: float, lon: float) -> bool:
-        try:
-            lat = float(lat)
-            lon = float(lon)
-            return -90 <= lat <= 90 and -180 <= lon <= 180
-        except (TypeError, ValueError):
-            return False
-    
-    def _validate_location_data(self, data: Dict) -> bool:
-        if 'city' in data and data['city'] and data['city'] != 'Unknown':
-            return True
-        if 'suburb' in data and data['suburb']:
-            return True
-        if 'locality' in data and data['locality']:
-            return True
-        if 'neighbourhood' in data and data['neighbourhood']:
-            return True
-        
-        logger.warning(f"Location validation failed: {data}")
-        return False
-    
-    def _is_private_ip(self, ip: str) -> bool:
-        private_ranges = ['127.', '10.', '172.16.', '172.17.', '172.18.', '172.19.',
-                         '172.20.', '172.21.', '172.22.', '172.23.', '172.24.',
-                         '172.25.', '172.26.', '172.27.', '172.28.', '172.29.',
-                         '172.30.', '172.31.', '192.168.', '::1', 'localhost']
-        return any(ip.startswith(prefix) for prefix in private_ranges)
-    
-    def _generate_cache_key(self, prefix: str, *args) -> str:
-        key_string = f"{prefix}:{'_'.join(str(arg) for arg in args)}"
-        return hashlib.md5(key_string.encode()).hexdigest()
-    
-    def _get_from_cache(self, key: str) -> Optional[Dict]:
-        if key in self._cache:
-            data, timestamp = self._cache[key]
-            if time.time() - timestamp < self.CACHE_DURATION:
-                return data
-            else:
-                del self._cache[key]
-        return None
-    
-    def _add_to_cache(self, key: str, data: Dict) -> None:
-        self._cache[key] = (data, time.time())
-    
-    def clear_cache(self) -> None:
-        self._cache.clear()
-        logger.info("Location cache cleared")
-    
-    def get_stats(self) -> Dict:
-        cache_hit_rate = ((self._stats['cache_hits'] / self._stats['total_requests'] * 100) 
-                         if self._stats['total_requests'] > 0 else 0)
-        
-        return {
-            **self._stats,
-            'cache_hit_rate': f"{cache_hit_rate:.2f}%",
-            'cached_entries': len(self._cache)
-        }
-
-location_service = LocationService(
-    openweather_api_key=OPENWEATHER_API_KEY,
-    geocode_api_key=GEOCODE_API_KEY,
-    ipgeolocation_api_key=IPGEOLOCATION_API_KEY,
-    google_maps_api_key=GOOGLE_MAPS_API_KEY
-)
-
-WEATHER_CONDITION_MAP = {
-    'Clear': {
-        'playlist': 'happy pop upbeat',
-        'sound': 'https://cdn.pixabay.com/audio/2022/03/22/audio_1e5d97d57a.mp3',
-        'activities': ['Hiking', 'Picnic', 'Beach visit', 'Outdoor photography', 'Cycling', 'Running'],
-        'mood': 'energetic',
-        'color_palette': ['#FFD700', '#FFA500', '#87CEEB', '#00BFFF'],
-        'emoji': '☀️',
-        'clothing': ['Sunglasses', 'Light clothing', 'Sunscreen', 'Hat'],
-        'health_tips': ['Stay hydrated', 'Use SPF 30+ sunscreen', 'Avoid peak sun hours']
-    },
-    'Clouds': {
-        'playlist': 'chill vibes relaxing',
-        'sound': 'https://cdn.pixabay.com/audio/2021/08/09/audio_0625c1539c.mp3',
-        'activities': ['Museum visit', 'Shopping', 'Outdoor walk', 'Coffee shop'],
-        'mood': 'relaxed',
-        'color_palette': ['#808080', '#A9A9A9', '#D3D3D3', '#778899'],
-        'emoji': '☁️',
-        'clothing': ['Light jacket', 'Comfortable shoes', 'Layers'],
-        'health_tips': ['Perfect weather for outdoor activities', 'Stay active']
-    },
-    'Rain': {
-        'playlist': 'rainy day jazz',
-        'sound': 'https://cdn.pixabay.com/audio/2022/03/10/audio_c9054832ff.mp3',
-        'activities': ['Movie marathon', 'Reading', 'Indoor cafe', 'Cooking'],
-        'mood': 'cozy',
-        'color_palette': ['#4682B4', '#5F9EA0', '#708090', '#2F4F4F'],
-        'emoji': '🌧️',
-        'clothing': ['Umbrella', 'Raincoat', 'Waterproof shoes'],
-        'health_tips': ['Stay warm and dry', 'Hot beverages recommended']
-    },
-    'Drizzle': {
-        'playlist': 'peaceful piano',
-        'sound': 'https://cdn.pixabay.com/audio/2022/03/10/audio_d0d5b89a6c.mp3',
-        'activities': ['Umbrella walk', 'Photography', 'Bookstore visit', 'Tea time'],
-        'mood': 'contemplative',
-        'color_palette': ['#B0C4DE', '#ADD8E6', '#87CEEB', '#6495ED'],
-        'emoji': '🌦️',
-        'clothing': ['Light rain jacket', 'Umbrella', 'Comfortable shoes'],
-        'health_tips': ['Perfect for contemplation', 'Stay moderately active']
-    },
-    'Snow': {
-        'playlist': 'winter acoustic',
-        'sound': 'https://cdn.pixabay.com/audio/2022/01/18/audio_12b2c26c8c.mp3',
-        'activities': ['Build snowman', 'Hot chocolate', 'Winter photography', 'Sledding'],
-        'mood': 'peaceful',
-        'color_palette': ['#FFFFFF', '#F0F8FF', '#E0FFFF', '#B0E0E6'],
-        'emoji': '❄️',
-        'clothing': ['Heavy coat', 'Gloves', 'Scarf', 'Winter boots'],
-        'health_tips': ['Layer up', 'Protect extremities', 'Stay warm']
-    },
-    'Thunderstorm': {
-        'playlist': 'epic cinematic',
-        'sound': 'https://cdn.pixabay.com/audio/2021/08/04/audio_12b0c7443c.mp3',
-        'activities': ['Stay indoors', 'Board games', 'Movie watching', 'Baking'],
-        'mood': 'intense',
-        'color_palette': ['#2F4F4F', '#36454F', '#343434', '#800080'],
-        'emoji': '⛈️',
-        'clothing': ['Stay indoors', 'Emergency kit ready'],
-        'health_tips': ['Stay indoors', 'Avoid electrical devices']
-    },
-    'Mist': {
-        'playlist': 'ambient soundscapes',
-        'sound': 'https://cdn.pixabay.com/audio/2021/10/07/audio_bb630cc098.mp3',
-        'activities': ['Meditation', 'Yoga', 'Gentle walk', 'Spa day'],
-        'mood': 'mysterious',
-        'color_palette': ['#F5F5F5', '#DCDCDC', '#C0C0C0', '#A9A9A9'],
-        'emoji': '🌫️',
-        'clothing': ['Light layers', 'Visibility clothing'],
-        'health_tips': ['Drive carefully', 'Use visibility aids']
-    },
-}
 
 WEATHER_FUN_FACTS = [
     "The highest temperature ever recorded on Earth was 134°F (56.7°C) in Death Valley, California in 1913",
     "Lightning strikes the Earth about 100 times every second",
-    "Antarctica is the world's largest desert",
+    "Antarctica is the world's largest desert by area, not the Sahara",
     "Modern weather forecasting has a 5-day accuracy rate of approximately 90%",
     "Rainbows are actually full circles, but we typically see only half from ground level",
     "A single cumulus cloud can weigh more than 1 million pounds",
     "The fastest wind speed ever recorded was 253 mph during Tropical Cyclone Olivia in 1996",
+    "Snowflakes have six sides due to the molecular structure of water",
+    "The Amazon rainforest produces about 20% of the world's oxygen",
+    "Tornadoes can have wind speeds exceeding 300 mph",
+    "The driest place on Earth is the Atacama Desert in Chile",
+    "Hailstones can be as large as grapefruits and fall at 100+ mph",
+    "Weather satellites orbit Earth at 22,236 miles above the equator",
+    "A single raindrop falls at about 20 mph",
+    "The word 'hurricane' comes from the Mayan storm god Hurakan"
 ]
 
-GLOBAL_CITIES = [
-    'Tokyo,JP', 'London,UK', 'Paris,FR', 'New York,US', 'Sydney,AU',
-    'Dubai,AE', 'Singapore,SG', 'Mumbai,IN', 'Toronto,CA', 'Berlin,DE',
-    'Rome,IT', 'Barcelona,ES', 'Rio de Janeiro,BR', 'Cairo,EG', 'Bangkok,TH',
-]
+COMPREHENSIVE_RECOMMENDATIONS = {
+    'Clear': {
+        'morning': {
+            'health_safety': {
+                'uv_warning': 'Low to moderate UV levels',
+                'air_quality': 'Excellent conditions for outdoor activities',
+                'heat_stress': 'Minimal risk, perfect for exercise',
+                'safety_tips': ['Apply sunscreen', 'Stay hydrated', 'Perfect for outdoor exercise'],
+                'health_benefits': ['Vitamin D absorption', 'Fresh air benefits', 'Mood enhancement']
+            },
+            'clothing': {
+                'recommended': ['Light athletic wear', 'Breathable fabrics', 'Light cap', 'Sunglasses'],
+                'avoid': ['Heavy layers', 'Dark colors', 'Non-breathable materials'],
+                'accessories': ['Water bottle', 'Sunscreen SPF 30+', 'Fitness tracker'],
+                'footwear': ['Running shoes', 'Breathable sneakers', 'Athletic socks']
+            },
+            'activities': {
+                'highly_recommended': ['Jogging', 'Cycling', 'Outdoor yoga', 'Hiking', 'Photography'],
+                'suitable': ['Walking', 'Gardening', 'Outdoor sports', 'Picnic preparation'],
+                'avoid': ['Heavy outdoor work', 'Prolonged sun exposure'],
+                'energy_level': 'High - perfect for active pursuits'
+            },
+            'spotify_moods': ['workout', 'morning motivation', 'upbeat pop', 'energetic indie'],
+            'color_palette': ['#FFD700', '#FFA500', '#87CEEB', '#00BFFF', '#32CD32'],
+            'fun_facts': [
+                'Morning sunlight helps regulate circadian rhythm',
+                'Cool morning air contains more oxygen',
+                'Early morning is the best time for vitamin D synthesis'
+            ]
+        },
+        'afternoon': {
+            'health_safety': {
+                'uv_warning': 'High UV levels - protection required',
+                'air_quality': 'Monitor air quality during peak heat',
+                'heat_stress': 'Moderate to high risk during peak hours',
+                'safety_tips': ['Seek shade 12-4PM', 'Increase water intake', 'Limit strenuous activity'],
+                'health_benefits': ['Peak daylight exposure', 'High energy levels', 'Social activity time']
+            },
+            'clothing': {
+                'recommended': ['Lightweight clothing', 'Sun hat', 'UV-protective clothing', 'Sunglasses'],
+                'avoid': ['Heavy fabrics', 'Dark colors', 'Tight clothing'],
+                'accessories': ['Large water bottle', 'Cooling towel', 'Portable shade'],
+                'footwear': ['Ventilated shoes', 'Moisture-wicking socks', 'Sandals for casual wear']
+            },
+            'activities': {
+                'highly_recommended': ['Swimming', 'Beach activities', 'Shaded outdoor dining', 'Indoor sports'],
+                'suitable': ['Shopping', 'Museum visits', 'Air-conditioned venues'],
+                'avoid': ['Intense outdoor exercise', 'Prolonged sun exposure', 'Heavy physical work'],
+                'energy_level': 'Peak - but avoid overheating'
+            },
+            'spotify_moods': ['summer hits', 'beach vibes', 'pop classics', 'feel good music'],
+            'color_palette': ['#FF6B35', '#F7931E', '#FFD23F', '#06FFA5', '#FF4081'],
+            'fun_facts': [
+                'Peak UV radiation occurs between 12-4 PM',
+                'Afternoon light is ideal for photography',
+                'Body temperature naturally peaks in afternoon'
+            ]
+        },
+        'evening': {
+            'health_safety': {
+                'uv_warning': 'Decreasing UV levels - minimal protection needed',
+                'air_quality': 'Excellent for outdoor activities',
+                'heat_stress': 'Low risk, comfortable conditions',
+                'safety_tips': ['Perfect time for exercise', 'Stay visible if walking', 'Hydration still important'],
+                'health_benefits': ['Stress relief', 'Social connection', 'Improved sleep preparation']
+            },
+            'clothing': {
+                'recommended': ['Light layers', 'Comfortable casual wear', 'Light jacket if breezy'],
+                'avoid': ['Heavy clothing', 'Overdressing'],
+                'accessories': ['Light scarf', 'Comfortable shoes', 'Phone light for visibility'],
+                'footwear': ['Comfortable walking shoes', 'Casual sneakers', 'Breathable options']
+            },
+            'activities': {
+                'highly_recommended': ['Outdoor dining', 'Walking', 'Social gatherings', 'Sunset viewing'],
+                'suitable': ['Light exercise', 'Photography', 'Outdoor events', 'Barbecue'],
+                'avoid': ['Intense workouts', 'Heavy meals before activity'],
+                'energy_level': 'Moderate to high - ideal for social activities'
+            },
+            'spotify_moods': ['sunset chill', 'acoustic evening', 'indie folk', 'mellow vibes'],
+            'color_palette': ['#FF8C42', '#FF6B35', '#C73E1D', '#592E34', '#8E44AD'],
+            'fun_facts': [
+                'Golden hour provides the best natural lighting',
+                'Evening exercise can improve sleep quality',
+                'Sunset colors are caused by light scattering'
+            ]
+        },
+        'night': {
+            'health_safety': {
+                'uv_warning': 'No UV concern',
+                'air_quality': 'Cool, fresh air ideal for relaxation',
+                'heat_stress': 'No risk, comfortable conditions',
+                'safety_tips': ['Use proper lighting', 'Dress for temperature drop', 'Stay visible'],
+                'health_benefits': ['Better sleep preparation', 'Stress reduction', 'Peaceful environment']
+            },
+            'clothing': {
+                'recommended': ['Light layers', 'Comfortable evening wear', 'Light jacket'],
+                'avoid': ['Too many layers', 'Uncomfortable clothing'],
+                'accessories': ['Light scarf', 'Comfortable shoes', 'Phone/flashlight'],
+                'footwear': ['Comfortable shoes', 'Non-slip soles', 'Warm socks if cool']
+            },
+            'activities': {
+                'highly_recommended': ['Stargazing', 'Peaceful walks', 'Outdoor socializing', 'Reading'],
+                'suitable': ['Light stretching', 'Meditation', 'Quiet conversations'],
+                'avoid': ['Intense exercise', 'Loud activities', 'Heavy meals'],
+                'energy_level': 'Low to moderate - focus on relaxation'
+            },
+            'spotify_moods': ['night jazz', 'ambient sleep', 'lo-fi chill', 'peaceful instrumentals'],
+            'color_palette': ['#2C3E50', '#34495E', '#5D6D7E', '#85929E', '#1ABC9C'],
+            'fun_facts': [
+                'Night air is typically 10-15% more humid',
+                'Stars are most visible during astronomical twilight',
+                'Cool night air can improve sleep quality'
+            ]
+        }
+    },
+    'Clouds': {
+        'morning': {
+            'health_safety': {
+                'uv_warning': 'Reduced UV levels due to cloud cover',
+                'air_quality': 'Stable air conditions, good for sensitive individuals',
+                'heat_stress': 'Very low risk, ideal exercise conditions',
+                'safety_tips': ['Perfect conditions for exercise', 'Light protection still recommended'],
+                'health_benefits': ['Comfortable temperature', 'Reduced glare', 'Stable conditions']
+            },
+            'clothing': {
+                'recommended': ['Comfortable layers', 'Light athletic wear', 'Versatile clothing'],
+                'avoid': ['Heavy sun protection', 'Overly light clothing'],
+                'accessories': ['Light jacket option', 'Water bottle', 'Comfortable shoes'],
+                'footwear': ['Athletic shoes', 'Comfortable sneakers', 'Breathable socks']
+            },
+            'activities': {
+                'highly_recommended': ['Running', 'Cycling', 'Outdoor sports', 'Walking', 'Hiking'],
+                'suitable': ['Any outdoor activity', 'Photography', 'Exercise', 'Gardening'],
+                'avoid': ['Activities requiring specific lighting'],
+                'energy_level': 'High - perfect conditions for activity'
+            },
+            'spotify_moods': ['indie morning', 'alternative rock', 'chill beats', 'acoustic pop'],
+            'color_palette': ['#BDC3C7', '#95A5A6', '#7F8C8D', '#AEB6BF', '#5DADE2'],
+            'fun_facts': [
+                'Cloudy mornings provide even, soft lighting',
+                'Cloud cover reduces temperature extremes',
+                'Overcast skies can enhance focus and productivity'
+            ]
+        },
+        'afternoon': {
+            'health_safety': {
+                'uv_warning': 'Moderate UV levels, some protection recommended',
+                'air_quality': 'Stable atmospheric conditions',
+                'heat_stress': 'Low risk, comfortable for most activities',
+                'safety_tips': ['Ideal conditions for most activities', 'Stay hydrated'],
+                'health_benefits': ['Comfortable exercise conditions', 'Reduced heat stress']
+            },
+            'clothing': {
+                'recommended': ['Casual layers', 'Comfortable clothing', 'Light options'],
+                'avoid': ['Heavy clothing', 'Excessive sun protection'],
+                'accessories': ['Light sweater option', 'Comfortable shoes', 'Water bottle'],
+                'footwear': ['Casual shoes', 'Comfortable walking shoes', 'Breathable options']
+            },
+            'activities': {
+                'highly_recommended': ['Outdoor exploration', 'Sports', 'Walking', 'Cycling'],
+                'suitable': ['Shopping', 'Sightseeing', 'Outdoor dining', 'Photography'],
+                'avoid': ['Sun-dependent activities'],
+                'energy_level': 'High - excellent for various activities'
+            },
+            'spotify_moods': ['indie pop', 'alternative hits', 'chill rock', 'acoustic covers'],
+            'color_palette': ['#D5DBDB', '#AEB6BF', '#85929E', '#566573', '#3498DB'],
+            'fun_facts': [
+                'Cloudy afternoons have consistent lighting for photography',
+                'Overcast conditions can boost creativity',
+                'Cloud cover provides natural air conditioning'
+            ]
+        },
+        'evening': {
+            'health_safety': {
+                'uv_warning': 'Minimal UV concern',
+                'air_quality': 'Stable, comfortable conditions',
+                'heat_stress': 'No risk, perfect comfort zone',
+                'safety_tips': ['Excellent conditions for evening activities'],
+                'health_benefits': ['Stress reduction', 'Comfortable socializing', 'Pleasant atmosphere']
+            },
+            'clothing': {
+                'recommended': ['Comfortable evening wear', 'Light layers', 'Casual options'],
+                'avoid': ['Heavy clothing', 'Overdressing'],
+                'accessories': ['Light jacket', 'Comfortable shoes', 'Evening accessories'],
+                'footwear': ['Comfortable evening shoes', 'Casual sneakers', 'Walking shoes']
+            },
+            'activities': {
+                'highly_recommended': ['Social gatherings', 'Outdoor dining', 'Walking', 'Events'],
+                'suitable': ['Exercise', 'Shopping', 'Entertainment', 'Relaxation'],
+                'avoid': ['Activities requiring specific weather'],
+                'energy_level': 'Moderate to high - great for social activities'
+            },
+            'spotify_moods': ['evening chill', 'indie acoustic', 'mellow rock', 'coffee shop vibes'],
+            'color_palette': ['#909497', '#717D7E', '#515A5A', '#2C3E50', '#8E44AD'],
+            'fun_facts': [
+                'Cloudy evenings often have dramatic skies',
+                'Overcast conditions can enhance mood lighting',
+                'Cloud cover moderates evening temperatures'
+            ]
+        },
+        'night': {
+            'health_safety': {
+                'uv_warning': 'No UV concern',
+                'air_quality': 'Stable, mild conditions',
+                'heat_stress': 'No risk, comfortable for rest',
+                'safety_tips': ['Comfortable conditions for evening activities'],
+                'health_benefits': ['Good sleeping conditions', 'Comfortable humidity', 'Peaceful environment']
+            },
+            'clothing': {
+                'recommended': ['Comfortable layers', 'Cozy evening wear', 'Light jacket'],
+                'avoid': ['Too light clothing', 'Uncomfortable fabrics'],
+                'accessories': ['Comfortable layers', 'Cozy accessories', 'Good shoes'],
+                'footwear': ['Comfortable shoes', 'Warm options if cool', 'Non-slip soles']
+            },
+            'activities': {
+                'highly_recommended': ['Indoor activities', 'Cozy socializing', 'Reading', 'Relaxation'],
+                'suitable': ['Light walks', 'Indoor entertainment', 'Quiet activities'],
+                'avoid': ['Outdoor activities requiring clear skies'],
+                'energy_level': 'Low to moderate - focus on comfort'
+            },
+            'spotify_moods': ['night ambient', 'lo-fi hip hop', 'jazz instrumentals', 'sleep sounds'],
+            'color_palette': ['#5D6D7E', '#566573', '#515A5A', '#424949', '#1ABC9C'],
+            'fun_facts': [
+                'Cloudy nights retain heat better than clear nights',
+                'Overcast skies create cozy atmospheric conditions',
+                'Cloud cover can improve sleep by reducing temperature fluctuations'
+            ]
+        }
+    },
+    'Rain': {
+        'morning': {
+            'health_safety': {
+                'uv_warning': 'Very low UV due to cloud cover',
+                'air_quality': 'Rain cleanses air, excellent quality',
+                'heat_stress': 'No risk, cool and comfortable',
+                'safety_tips': ['Stay dry', 'Watch for slippery surfaces', 'Use proper rain gear'],
+                'health_benefits': ['Clean air', 'Natural humidification', 'Peaceful atmosphere']
+            },
+            'clothing': {
+                'recommended': ['Waterproof jacket', 'Rain boots', 'Quick-dry clothing', 'Umbrella'],
+                'avoid': ['Cotton clothing', 'Suede/leather', 'Open shoes'],
+                'accessories': ['Umbrella', 'Waterproof bag', 'Rain hat', 'Waterproof phone case'],
+                'footwear': ['Waterproof boots', 'Non-slip soles', 'Quick-dry socks']
+            },
+            'activities': {
+                'highly_recommended': ['Indoor exercise', 'Cozy café visits', 'Reading', 'Indoor hobbies'],
+                'suitable': ['Museum visits', 'Shopping', 'Indoor sports', 'Cooking'],
+                'avoid': ['Outdoor sports', 'Electronics outdoors', 'Long outdoor exposure'],
+                'energy_level': 'Moderate - focus on indoor activities'
+            },
+            'spotify_moods': ['rainy day jazz', 'cozy coffee shop', 'indie folk', 'mellow acoustic'],
+            'color_palette': ['#5DADE2', '#3498DB', '#2980B9', '#1B4F72', '#85C1E9'],
+            'fun_facts': [
+                'Rain increases negative ions which can boost mood',
+                'The smell of rain is called petrichor',
+                'Rain sounds can improve focus and relaxation'
+            ]
+        },
+        'afternoon': {
+            'health_safety': {
+                'uv_warning': 'Minimal UV exposure',
+                'air_quality': 'Excellent due to rain washing pollutants',
+                'heat_stress': 'No risk, comfortable temperature',
+                'safety_tips': ['Avoid outdoor electrical hazards', 'Drive carefully', 'Stay warm'],
+                'health_benefits': ['Fresh air post-rain', 'Comfortable humidity', 'Stress relief from rain sounds']
+            },
+            'clothing': {
+                'recommended': ['Layered rain gear', 'Waterproof clothing', 'Warm layers', 'Rain accessories'],
+                'avoid': ['Light clothing', 'Non-waterproof items', 'White/light colors'],
+                'accessories': ['Quality umbrella', 'Waterproof bag', 'Warm scarf', 'Rain cover'],
+                'footwear': ['Waterproof shoes', 'Good tread', 'Warm socks', 'Quick-dry materials']
+            },
+            'activities': {
+                'highly_recommended': ['Indoor shopping', 'Movie theaters', 'Museums', 'Cozy restaurants'],
+                'suitable': ['Indoor sports', 'Libraries', 'Art galleries', 'Indoor entertainment'],
+                'avoid': ['Outdoor events', 'Beach activities', 'Picnics'],
+                'energy_level': 'Moderate - indoor focus recommended'
+            },
+            'spotify_moods': ['rainy afternoon', 'indie chill', 'acoustic covers', 'mellow hits'],
+            'color_palette': ['#7FB3D3', '#5DADE2', '#3498DB', '#2980B9', '#AED6F1'],
+            'fun_facts': [
+                'Rainy afternoons are perfect for creativity',
+                'Rain can reduce air temperature by 10-15 degrees',
+                'The sound of rain is scientifically proven to aid concentration'
+            ]
+        },
+        'evening': {
+            'health_safety': {
+                'uv_warning': 'No UV concern',
+                'air_quality': 'Fresh and clean post-rain',
+                'heat_stress': 'No risk, pleasant cool conditions',
+                'safety_tips': ['Be cautious of wet surfaces', 'Use good lighting', 'Stay warm'],
+                'health_benefits': ['Clean air breathing', 'Relaxing atmosphere', 'Natural cooling']
+            },
+            'clothing': {
+                'recommended': ['Cozy indoor wear', 'Warm layers', 'Comfortable clothing', 'Slippers'],
+                'avoid': ['Going out without rain gear', 'Light fabrics'],
+                'accessories': ['Warm blanket', 'Hot beverage', 'Cozy socks', 'Comfortable layers'],
+                'footwear': ['Indoor shoes', 'Warm socks', 'Comfortable slippers', 'Dry shoes']
+            },
+            'activities': {
+                'highly_recommended': ['Home cooking', 'Reading', 'Movie watching', 'Board games'],
+                'suitable': ['Indoor hobbies', 'Online activities', 'Video calls', 'Relaxation'],
+                'avoid': ['Outdoor dining', 'Outdoor events', 'Travel if possible'],
+                'energy_level': 'Low to moderate - perfect for relaxation'
+            },
+            'spotify_moods': ['rainy evening', 'cozy jazz', 'ambient relaxation', 'peaceful instrumentals'],
+            'color_palette': ['#AED6F1', '#85C1E9', '#5DADE2', '#3498DB', '#2E86AB'],
+            'fun_facts': [
+                'Rainy evenings create the coziest atmosphere',
+                'Rain sounds can lower cortisol levels',
+                'Evening rain often brings beautiful clear skies the next day'
+            ]
+        },
+        'night': {
+            'health_safety': {
+                'uv_warning': 'No UV concern',
+                'air_quality': 'Excellent, fresh rain-washed air',
+                'heat_stress': 'No risk, cool and comfortable',
+                'safety_tips': ['Stay indoors for comfort', 'Keep warm', 'Enjoy the peaceful sounds'],
+                'health_benefits': ['Perfect sleeping weather', 'Natural white noise', 'Fresh air']
+            },
+            'clothing': {
+                'recommended': ['Cozy pajamas', 'Warm layers', 'Comfortable sleepwear', 'Warm socks'],
+                'avoid': ['Light sleepwear if cold', 'Going outside unnecessarily'],
+                'accessories': ['Extra blankets', 'Warm drinks', 'Cozy slippers', 'Comfortable pillows'],
+                'footwear': ['Warm slippers', 'Cozy socks', 'Indoor shoes', 'Comfort priority']
+            },
+            'activities': {
+                'highly_recommended': ['Sleeping', 'Reading in bed', 'Meditation', 'Quiet relaxation'],
+                'suitable': ['Gentle stretching', 'Journaling', 'Quiet music', 'Rest'],
+                'avoid': ['Stimulating activities', 'Going outside', 'Loud activities'],
+                'energy_level': 'Very low - perfect for sleep'
+            },
+            'spotify_moods': ['rain sleep sounds', 'ambient night', 'peaceful meditation', 'sleep music'],
+            'color_palette': ['#D6EAF8', '#AED6F1', '#85C1E9', '#5DADE2', '#2E8B57'],
+            'fun_facts': [
+                'Rain at night creates the best sleeping conditions',
+                'Night rain sounds are nature\'s perfect white noise',
+                'Rainy nights often have the most restful sleep quality'
+            ]
+        }
+    }
+}
+
+def generate_cache_key(*args):
+    key_string = ':'.join(str(arg) for arg in args)
+    return hashlib.md5(key_string.encode()).hexdigest()
+
+def should_use_cache(location_data, cache_type='weather'):
+    if not redis_client:
+        return False
+    
+    current_time = time.time()
+    
+    if cache_type in ['weather_current', 'weather_forecast']:
+        lat = location_data.get('lat', 0)
+        lon = location_data.get('lon', 0)
+        
+        cache_key = generate_cache_key(cache_type, round(lat, 2), round(lon, 2))
+        cached_time_key = f"{cache_key}:timestamp"
+        
+        try:
+            cached_timestamp = redis_client.get(cached_time_key)
+            if cached_timestamp:
+                time_diff = current_time - float(cached_timestamp)
+                if time_diff < TEMPORAL_THRESHOLD:
+                    return True
+        except Exception as e:
+            logger.warning(f"Cache check error: {e}")
+    
+    return False
+
+def get_from_cache(cache_key, cache_type):
+    if not redis_client:
+        return request_cache.get(cache_key)
+    
+    try:
+        cached_data = redis_client.get(cache_key)
+        if cached_data:
+            return json.loads(cached_data)
+    except Exception as e:
+        logger.warning(f"Cache get error: {e}")
+        return request_cache.get(cache_key)
+    
+    return None
+
+def set_cache(cache_key, data, cache_type):
+    if redis_client:
+        try:
+            ttl = CACHE_TTLS.get(cache_type, 600)
+            redis_client.setex(cache_key, ttl, json.dumps(data, default=str))
+            redis_client.setex(f"{cache_key}:timestamp", ttl, str(time.time()))
+            return
+        except Exception as e:
+            logger.warning(f"Redis cache set error: {e}")
+    
+    request_cache[cache_key] = data
+
+def get_comprehensive_insights(weather_condition, temperature, time_period):
+    base_data = COMPREHENSIVE_RECOMMENDATIONS.get(weather_condition, COMPREHENSIVE_RECOMMENDATIONS['Clear'])
+    period_data = base_data.get(time_period, base_data['afternoon'])
+    
+    insights = period_data.copy()
+    
+    if temperature:
+        if temperature > 30:
+            insights['health_safety']['heat_stress'] = 'High risk - take precautions'
+            insights['health_safety']['safety_tips'].extend(['Seek air conditioning', 'Limit outdoor time'])
+            insights['clothing']['recommended'].extend(['Cooling towels', 'Light colors only'])
+            insights['activities']['avoid'].extend(['Intense outdoor exercise', 'Prolonged sun exposure'])
+        elif temperature < 5:
+            insights['health_safety']['heat_stress'] = 'Cold stress risk'
+            insights['health_safety']['safety_tips'].extend(['Layer properly', 'Protect extremities'])
+            insights['clothing']['recommended'].extend(['Thermal layers', 'Winter accessories'])
+            insights['activities']['highly_recommended'] = ['Indoor activities', 'Warm beverages']
+    
+    return insights
+
+def calculate_best_time_detailed(forecast_data, weather_condition, current_temp):
+    time_periods = ['morning', 'afternoon', 'evening', 'night']
+    period_scores = {}
+    
+    base_temps = {
+        'morning': current_temp - 2,
+        'afternoon': current_temp + 3,
+        'evening': current_temp,
+        'night': current_temp - 4
+    }
+    
+    for period in time_periods:
+        score = 50
+        estimated_temp = base_temps[period]
+        
+        comfort_score = 0
+        if 18 <= estimated_temp <= 25:
+            comfort_score = 30
+        elif 15 <= estimated_temp <= 28:
+            comfort_score = 20
+        elif 10 <= estimated_temp <= 32:
+            comfort_score = 10
+        
+        weather_score = 0
+        if weather_condition == 'Clear':
+            weather_score = 25
+        elif weather_condition == 'Clouds':
+            weather_score = 20
+        elif weather_condition in ['Rain', 'Drizzle']:
+            weather_score = 15 if period in ['evening', 'night'] else 10
+        elif weather_condition == 'Snow':
+            weather_score = 10
+        
+        period_bonus = {
+            'morning': 10 if weather_condition == 'Clear' else 5,
+            'afternoon': 15 if weather_condition in ['Clear', 'Clouds'] else 0,
+            'evening': 20,
+            'night': 10 if weather_condition in ['Rain', 'Snow'] else 5
+        }
+        
+        activity_suitability = 0
+        recommendations = COMPREHENSIVE_RECOMMENDATIONS.get(weather_condition, {}).get(period, {})
+        activities = recommendations.get('activities', {})
+        if len(activities.get('highly_recommended', [])) > 3:
+            activity_suitability = 15
+        
+        total_score = score + comfort_score + weather_score + period_bonus[period] + activity_suitability
+        
+        reasons = []
+        if comfort_score > 20:
+            reasons.append(f"Optimal temperature ({estimated_temp:.1f}°C)")
+        if weather_score > 15:
+            reasons.append(f"Excellent weather conditions")
+        if period_bonus[period] > 10:
+            reasons.append(f"Ideal time of day for activities")
+        if activity_suitability > 10:
+            reasons.append("Many suitable activities available")
+        
+        period_scores[period] = {
+            'score': min(100, max(0, total_score)),
+            'temperature': estimated_temp,
+            'reasons': reasons,
+            'condition': weather_condition,
+            'recommendations': recommendations
+        }
+    
+    best_period = max(period_scores.keys(), key=lambda k: period_scores[k]['score'])
+    
+    time_ranges = {
+        'morning': '6:00 AM - 12:00 PM',
+        'afternoon': '12:00 PM - 6:00 PM',
+        'evening': '6:00 PM - 10:00 PM',
+        'night': '10:00 PM - 6:00 AM'
+    }
+    
+    return {
+        'best_period': best_period,
+        'best_time_range': time_ranges[best_period],
+        'score': period_scores[best_period]['score'],
+        'why_best': period_scores[best_period]['reasons'],
+        'expected_temperature': period_scores[best_period]['temperature'],
+        'weather_condition': weather_condition,
+        'detailed_breakdown': period_scores,
+        'confidence': 'High' if period_scores[best_period]['score'] > 75 else 'Medium'
+    }
+
+def get_greeting():
+    hour = datetime.utcnow().hour
+    if hour < 6:
+        return "Good Night"
+    elif hour < 12:
+        return "Good Morning"
+    elif hour < 18:
+        return "Good Afternoon"
+    elif hour < 22:
+        return "Good Evening"
+    else:
+        return "Good Night"
 
 def get_moon_phase():
     year = datetime.now().year
@@ -801,19 +641,19 @@ def get_moon_phase():
     
     phases = ['New Moon', 'Waxing Crescent', 'First Quarter', 'Waxing Gibbous',
               'Full Moon', 'Waning Gibbous', 'Last Quarter', 'Waning Crescent']
-    
     emojis = ['🌑', '🌒', '🌓', '🌔', '🌕', '🌖', '🌗', '🌘']
     
     return {'phase': phases[b], 'emoji': emojis[b], 'illumination': round(jd * 100)}
-
-spotify_token_cache = {'token': None, 'expires_at': 0}
 
 def get_spotify_token():
     if not SPOTIFY_CLIENT_ID or not SPOTIFY_CLIENT_SECRET:
         return None
     
-    if spotify_token_cache['token'] and time.time() < spotify_token_cache['expires_at']:
-        return spotify_token_cache['token']
+    cache_key = "spotify_token"
+    cached_token = get_from_cache(cache_key, 'spotify')
+    
+    if cached_token and cached_token.get('expires_at', 0) > time.time():
+        return cached_token.get('token')
     
     auth_string = f"{SPOTIFY_CLIENT_ID}:{SPOTIFY_CLIENT_SECRET}"
     auth_bytes = auth_string.encode('utf-8')
@@ -831,680 +671,399 @@ def get_spotify_token():
         response.raise_for_status()
         token_data = response.json()
         
-        spotify_token_cache['token'] = token_data.get('access_token')
-        spotify_token_cache['expires_at'] = time.time() + token_data.get('expires_in', 3600) - 60
+        token_cache = {
+            'token': token_data.get('access_token'),
+            'expires_at': time.time() + token_data.get('expires_in', 3600) - 60
+        }
         
-        return spotify_token_cache['token']
+        set_cache(cache_key, token_cache, 'spotify')
+        return token_cache['token']
     except Exception as e:
         logger.error(f"Spotify authentication failed: {e}")
         return None
 
-def get_greeting():
-    hour = datetime.now(timezone.utc).hour
-    
-    if hour < 6:
-        return "Good Night"
-    elif hour < 12:
-        return "Good Morning"
-    elif hour < 18:
-        return "Good Afternoon"
-    elif hour < 22:
-        return "Good Evening"
-    else:
-        return "Good Night"
-
-def calculate_weather_score(data):
-    score = 50
-    temp = data.get('temperature', {}).get('current', 20)
-    if 18 <= temp <= 25:
-        score += 20
-    elif 15 <= temp <= 30:
-        score += 10
-    else:
-        score -= 10
-    
-    humidity = data.get('details', {}).get('humidity', 50)
-    if 30 <= humidity <= 60:
-        score += 15
-    elif humidity > 80:
-        score -= 10
-    
-    wind_speed = data.get('details', {}).get('wind', {}).get('speed', 0)
-    if wind_speed < 5:
-        score += 10
-    elif wind_speed > 15:
-        score -= 10
-    
-    return max(0, min(100, score))
-
-def calculate_uv_index(lat, lon):
-    try:
-        url = f"https://api.openweathermap.org/data/2.5/uvi?lat={lat}&lon={lon}&appid={OPENWEATHER_API_KEY}"
-        response = requests.get(url, timeout=5)
-        data = response.json()
-        uv_value = data.get('value', 0)
-        
-        if uv_value < 3:
-            level = 'Low'
-            advice = 'No protection required'
-        elif uv_value < 6:
-            level = 'Moderate'
-            advice = 'Protection required'
-        elif uv_value < 8:
-            level = 'High'
-            advice = 'Protection required'
-        elif uv_value < 11:
-            level = 'Very High'
-            advice = 'Extra protection required'
-        else:
-            level = 'Extreme'
-            advice = 'Avoid sun exposure'
-        
-        return {'value': uv_value, 'level': level, 'advice': advice}
-    except:
-        return None
-
-def get_air_quality(lat, lon):
-    try:
-        url = f"http://api.openweathermap.org/data/2.5/air_pollution?lat={lat}&lon={lon}&appid={OPENWEATHER_API_KEY}"
-        response = requests.get(url, timeout=5)
-        data = response.json()
-        aqi = data['list'][0]['main']['aqi']
-        components = data['list'][0]['components']
-        
-        aqi_levels = {
-            1: {'level': 'Good', 'color': '#00e400', 'advice': 'Air quality is perfect. Great day for outdoor activities!'},
-            2: {'level': 'Fair', 'color': '#ffff00', 'advice': 'Air quality is acceptable. Sensitive groups should limit prolonged outdoor exertion.'},
-            3: {'level': 'Moderate', 'color': '#ff7e00', 'advice': 'Members of sensitive groups may experience health effects.'},
-            4: {'level': 'Poor', 'color': '#ff0000', 'advice': 'Everyone may begin to experience health effects.'},
-            5: {'level': 'Very Poor', 'color': '#8f3f97', 'advice': 'Health alert! Everyone may experience more serious health effects.'}
-        }
-        
-        aqi_info = aqi_levels.get(aqi, aqi_levels[1])
-        
-        return {
-            'aqi': aqi,
-            'level': aqi_info['level'],
-            'color': aqi_info['color'],
-            'advice': aqi_info['advice'],
-            'components': {
-                'pm2_5': round(components.get('pm2_5', 0), 2),
-                'pm10': round(components.get('pm10', 0), 2),
-                'o3': round(components.get('o3', 0), 2),
-                'no2': round(components.get('no2', 0), 2),
-                'co': round(components.get('co', 0), 2),
-                'so2': round(components.get('so2', 0), 2)
-            }
-        }
-    except Exception as e:
-        logger.error(f"Air quality fetch failed: {e}")
-        return None
-
-def get_best_time_today(forecast_data):
-    if not forecast_data or 'list' not in forecast_data:
-        return None
-    
-    best_time = None
-    best_score = 0
-    
-    for item in forecast_data['list'][:8]:
-        temp = item['main']['temp']
-        weather = item['weather'][0]['main']
-        wind = item['wind']['speed']
-        
-        score = 50
-        if 18 <= temp <= 25:
-            score += 30
-        if weather == 'Clear':
-            score += 20
-        if wind < 5:
-            score += 10
-        
-        if score > best_score:
-            best_score = score
-            best_time = {
-                'time': datetime.fromtimestamp(item['dt']).strftime('%I:%M %p'),
-                'temperature': round(temp, 1),
-                'weather': weather,
-                'score': score
-            }
-    
-    return best_time
+def clean_expired_requests():
+    """Clean up expired active requests"""
+    current_time = time.time()
+    expired_keys = [key for key, timestamp in active_location_requests.items() 
+                   if current_time - timestamp > 30]  # 30 second timeout
+    for key in expired_keys:
+        active_location_requests.pop(key, None)
 
 @app.route('/', methods=['GET'])
 def home():
-    accuracy_mode = "100% Accurate - Google Maps" if GOOGLE_MAPS_API_KEY else "High Accuracy"
-    providers = ["Google Geocoding API", "Nominatim-OSM", "BigDataCloud", "LocationIQ"] if GOOGLE_MAPS_API_KEY else ["Nominatim-OSM", "BigDataCloud", "LocationIQ"]
-    
     return jsonify({
         'service': 'SkyVibe Weather API',
-        'version': '2.1.1',
+        'version': '3.2.0',
         'status': 'operational',
-        'location_accuracy': accuracy_mode,
-        'providers': providers,
-        'ip_location_note': 'IP location may show ISP/data center location. Use GPS for exact location.',
-        'endpoints': {
-            'health': 'GET /health',
-            'location_coords': 'POST /api/location/coords',
-            'location_ip': 'GET /api/location/auto',
-            'weather_current': 'GET /api/weather/current',
-            'weather_forecast': 'GET /api/weather/forecast',
-            'weather_alerts': 'GET /api/weather/alerts',
-            'weather_explore': 'GET /api/weather/explore',
-            'fun_fact': 'GET /api/insights/fun-fact',
-            'activities': 'GET /api/insights/activities',
-            'spotify': 'GET /api/entertainment/spotify',
-            'sounds': 'GET /api/entertainment/sounds',
-            'stats': 'GET /api/stats'
-        }
+        'environment': os.getenv('FLASK_ENV', 'production'),
+        'features': [
+            'Comprehensive Time-Based Recommendations',
+            'Smart Caching & Request Optimization',
+            'Health & Safety Insights',
+            'Clothing & Activity Recommendations',
+            'Best Time Analysis',
+            'Color Palettes & Fun Facts',
+            'Production-Ready Performance'
+        ],
+        'cache_status': 'Redis' if redis_client else 'Memory',
+        'deployment': 'Render Ready'
     }), 200
 
 @app.route('/health', methods=['GET'])
 def health_check():
-    stats = location_service.get_stats()
-    
     return jsonify({
         'status': 'healthy',
         'service': 'SkyVibe Weather API',
-        'version': '2.1.1',
-        'timestamp': datetime.now(timezone.utc).isoformat(),
-        'google_maps_enabled': bool(GOOGLE_MAPS_API_KEY),
-        'statistics': stats,
-        'ip_location_accuracy': 'ISP/Data Center level - Use GPS for exact location'
+        'version': '3.2.0',
+        'timestamp': datetime.utcnow().isoformat(),
+        'cache_status': 'active' if redis_client else 'memory',
+        'environment': os.getenv('FLASK_ENV', 'production')
     }), 200
 
-@app.route('/api/location/coords', methods=['POST'])
-@limiter.limit("200 per hour")
-def get_location_by_coords():
-    data = request.get_json()
-    
-    if not data or 'lat' not in data or 'lon' not in data:
-        return jsonify({
-            'success': False,
-            'error': 'Missing coordinates. Please provide lat and lon.',
-            'code': 'MISSING_COORDINATES'
-        }), 400
-    
-    try:
-        lat = float(data['lat'])
-        lon = float(data['lon'])
-        
-        logger.info(f"Processing GPS coordinates: lat={lat}, lon={lon}")
-        
-        location = location_service.get_location_from_coordinates(lat, lon, use_cache=False)
-        greeting = get_greeting()
-        moon = get_moon_phase()
-        
-        full_location = location_service._format_full_location(location)
-        
-        return jsonify({
-            'success': True,
-            'location': location,
-            'display_location': full_location,
-            'greeting': greeting,
-            'moon_phase': moon,
-            'timestamp': datetime.now(timezone.utc).isoformat()
-        }), 200
-        
-    except ValueError as e:
-        logger.warning(f"Invalid coordinates: {e}")
-        return jsonify({
-            'success': False,
-            'error': 'Invalid coordinates format',
-            'code': 'INVALID_COORDINATES'
-        }), 400
-        
-    except LocationServiceError as e:
-        logger.error(f"Location service error: {e}")
-        return jsonify({
-            'success': False,
-            'error': str(e),
-            'code': 'LOCATION_SERVICE_ERROR'
-        }), 503
-        
-    except Exception as e:
-        logger.exception(f"Unexpected error: {e}")
-        return jsonify({
-            'success': False,
-            'error': 'Internal server error',
-            'code': 'INTERNAL_ERROR'
-        }), 500
-
 @app.route('/api/location/auto', methods=['GET'])
-@limiter.limit("200 per hour")
+@limiter.limit("500 per hour")
 def auto_detect_location():
     ip_address = request.headers.get('X-Forwarded-For', request.remote_addr)
     if ip_address:
         ip_address = ip_address.split(',')[0].strip()
     
+    session_id = request.headers.get('X-Session-ID') or str(uuid.uuid4())
+    
+    # Clean expired requests
+    clean_expired_requests()
+    
+    # Check if there's already an active request for this IP
+    request_key = f"{ip_address}:{session_id}"
+    if request_key in active_location_requests:
+        return jsonify({
+            'success': False,
+            'error': 'Location request already in progress',
+            'code': 'REQUEST_IN_PROGRESS'
+        }), 429
+    
     try:
-        logger.info(f"Processing IP-based location: {ip_address or 'auto'}")
+        # Mark request as active
+        active_location_requests[request_key] = time.time()
         
-        location = location_service.get_location_from_ip(ip_address)
-        greeting = get_greeting()
-        moon = get_moon_phase()
+        cache_key = generate_cache_key('location_ip', ip_address)
         
-        full_location = location_service._format_full_location(location)
-        
-        return jsonify({
-            'success': True,
-            'location': location,
-            'display_location': full_location,
-            'greeting': greeting,
-            'moon_phase': moon,
-            'timestamp': datetime.now(timezone.utc).isoformat(),
-            'note': 'IP location may show ISP/data center location. For exact location, enable GPS.'
-        }), 200
-        
-    except LocationServiceError as e:
-        logger.error(f"Location error: {e}")
-        return jsonify({
-            'success': False,
-            'error': str(e),
-            'code': 'LOCATION_SERVICE_ERROR'
-        }), 503
-        
-    except Exception as e:
-        logger.exception(f"Unexpected error: {e}")
-        return jsonify({
-            'success': False,
-            'error': 'Internal server error',
-            'code': 'INTERNAL_ERROR'
-        }), 500
-
-@app.route('/api/weather/current', methods=['GET'])
-@limiter.limit("200 per hour")
-def get_current_weather():
-    if not OPENWEATHER_API_KEY:
-        return jsonify({'error': 'Weather service not configured', 'success': False}), 500
-    
-    city = request.args.get('city')
-    lat = request.args.get('lat', type=float)
-    lon = request.args.get('lon', type=float)
-    units = request.args.get('units', 'metric')
-    
-    if not city and not (lat and lon):
-        ip_address = request.headers.get('X-Forwarded-For', request.remote_addr)
-        if ip_address:
-            ip_address = ip_address.split(',')[0].strip()
+        cached_location = get_from_cache(cache_key, 'location_ip')
+        if cached_location:
+            logger.info(f"Using cached location for IP: {ip_address}")
+            response_data = {
+                'success': True,
+                'location': cached_location['location'],
+                'display_location': cached_location['display_location'],
+                'greeting': get_greeting(),
+                'moon_phase': get_moon_phase(),
+                'session_id': session_id,
+                'cache_hit': True,
+                'timestamp': datetime.utcnow().isoformat()
+            }
+            return jsonify(response_data), 200
         
         try:
-            location = location_service.get_location_from_ip(ip_address)
-            lat, lon = location['lat'], location['lon']
-        except LocationServiceError:
+            logger.info(f"Processing enhanced IP location: {ip_address or 'auto'}")
+            
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            location = loop.run_until_complete(
+                location_service.get_location_from_ip_enhanced(ip_address, session_id)
+            )
+            loop.close()
+            
+            greeting = get_greeting()
+            moon = get_moon_phase()
+            full_location = location_service.format_full_location(location)
+            
+            location_data = {
+                'lat': location.lat,
+                'lon': location.lon,
+                'accuracy': location.accuracy,
+                'confidence': location.confidence,
+                'provider': location.provider,
+                'source_type': location.source_type,
+                'city': location.city,
+                'state': location.state,
+                'country': location.country,
+                'country_code': location.country_code,
+                'suburb': location.suburb,
+                'neighbourhood': location.neighbourhood,
+                'road': location.road,
+                'house_number': location.house_number,
+                'zipcode': location.zipcode,
+                'formatted_address': location.formatted_address
+            }
+            
+            cache_data = {
+                'location': location_data,
+                'display_location': full_location
+            }
+            set_cache(cache_key, cache_data, 'location_ip')
+            
+            response_data = {
+                'success': True,
+                'location': location_data,
+                'display_location': full_location,
+                'greeting': greeting,
+                'moon_phase': moon,
+                'session_id': session_id,
+                'accuracy_details': {
+                    'method': 'Multi-provider consensus',
+                    'confidence_score': f"{location.confidence:.2%}",
+                    'accuracy_radius': f"{(1-location.accuracy)*100:.1f}km"
+                },
+                'cache_hit': False,
+                'timestamp': datetime.utcnow().isoformat()
+            }
+            
+            return jsonify(response_data), 200
+            
+        except Exception as e:
+            logger.error(f"Location error: {e}")
             return jsonify({
                 'success': False,
-                'error': 'Location required',
-                'code': 'LOCATION_REQUIRED'
-            }), 400
-    
-    if lat and lon:
-        url = f"https://api.openweathermap.org/data/2.5/weather?lat={lat}&lon={lon}&units={units}&appid={OPENWEATHER_API_KEY}"
-    else:
-        url = f"https://api.openweathermap.org/data/2.5/weather?q={city}&units={units}&appid={OPENWEATHER_API_KEY}"
-    
-    try:
-        response = requests.get(url, timeout=10)
-        response.raise_for_status()
-        data = response.json()
-        
-        weather_main = data['weather'][0]['main']
-        weather_config = WEATHER_CONDITION_MAP.get(weather_main, WEATHER_CONDITION_MAP['Clear'])
-        
-        uv_index = calculate_uv_index(data['coord']['lat'], data['coord']['lon'])
-        air_quality = get_air_quality(data['coord']['lat'], data['coord']['lon'])
-        
-        result = {
-            'success': True,
-            'location': {
-                'name': data.get('name', 'Unknown'),
-                'country': data['sys'].get('country', 'Unknown'),
-                'coordinates': {
-                    'lat': data['coord'].get('lat'),
-                    'lon': data['coord'].get('lon')
-                }
-            },
-            'weather': {
-                'main': weather_main,
-                'description': data['weather'][0]['description'].title(),
-                'icon': data['weather'][0]['icon'],
-                'mood': weather_config['mood'],
-                'emoji': weather_config['emoji']
-            },
-            'temperature': {
-                'current': round(data['main']['temp'], 1),
-                'feels_like': round(data['main']['feels_like'], 1),
-                'min': round(data['main']['temp_min'], 1),
-                'max': round(data['main']['temp_max'], 1),
-                'unit': '°C' if units == 'metric' else '°F'
-            },
-            'details': {
-                'humidity': data['main']['humidity'],
-                'pressure': data['main']['pressure'],
-                'visibility': round(data.get('visibility', 0) / 1000, 1),
-                'wind': {
-                    'speed': data['wind']['speed'],
-                    'deg': data['wind'].get('deg'),
-                    'unit': 'm/s' if units == 'metric' else 'mph'
-                },
-                'clouds': data['clouds']['all'],
-                'uv_index': uv_index,
-                'air_quality': air_quality
-            },
-            'precipitation': {
-                'rain_1h': data.get('rain', {}).get('1h', 0),
-                'rain_3h': data.get('rain', {}).get('3h', 0),
-                'snow_1h': data.get('snow', {}).get('1h', 0),
-                'snow_3h': data.get('snow', {}).get('3h', 0)
-            },
-            'sun': {
-                'sunrise': datetime.fromtimestamp(data['sys']['sunrise']).isoformat(),
-                'sunset': datetime.fromtimestamp(data['sys']['sunset']).isoformat()
-            },
-            'color_palette': weather_config['color_palette'],
-            'clothing_recommendations': weather_config['clothing'],
-            'health_tips': weather_config['health_tips'],
-            'timestamp': datetime.fromtimestamp(data['dt']).isoformat()
-        }
-        
-        result['weather_score'] = calculate_weather_score(result)
-        
-        return jsonify(result), 200
-        
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Weather API error: {e}")
-        return jsonify({'error': 'Weather service unavailable', 'success': False}), 503
+                'error': str(e),
+                'code': 'LOCATION_SERVICE_ERROR'
+            }), 503
+            
+    finally:
+        # Always clean up the active request marker
+        active_location_requests.pop(request_key, None)
 
-@app.route('/api/weather/forecast', methods=['GET'])
-@limiter.limit("150 per hour")
-def get_forecast():
-    if not OPENWEATHER_API_KEY:
-        return jsonify({'error': 'Weather service not configured', 'success': False}), 500
-    
-    city = request.args.get('city')
-    lat = request.args.get('lat', type=float)
-    lon = request.args.get('lon', type=float)
-    units = request.args.get('units', 'metric')
-    days = request.args.get('days', 7, type=int)
-    include_hourly = request.args.get('hourly', 'false').lower() == 'true'
-    
-    if not city and not (lat and lon):
-        ip_address = request.headers.get('X-Forwarded-For', request.remote_addr)
-        if ip_address:
-            ip_address = ip_address.split(',')[0].strip()
-        
-        try:
-            location = location_service.get_location_from_ip(ip_address)
-            lat, lon = location['lat'], location['lon']
-        except:
-            return jsonify({'error': 'Location required', 'success': False}), 400
-    
-    if city and not (lat and lon):
-        geo_url = f"http://api.openweathermap.org/geo/1.0/direct?q={city}&limit=1&appid={OPENWEATHER_API_KEY}"
-        try:
-            geo_response = requests.get(geo_url, timeout=5)
-            geo_data = geo_response.json()
-            if geo_data:
-                lat, lon = geo_data[0]['lat'], geo_data[0]['lon']
-        except:
-            pass
-    
-    url = f"https://api.openweathermap.org/data/2.5/forecast?lat={lat}&lon={lon}&units={units}&appid={OPENWEATHER_API_KEY}"
-    
-    try:
-        response = requests.get(url, timeout=10)
-        response.raise_for_status()
-        data = response.json()
-        
-        daily_forecast = {}
-        hourly_forecast = []
-        
-        for item in data['list'][:min(40, days * 8)]:
-            dt = datetime.fromtimestamp(item['dt'])
-            date_key = dt.date().isoformat()
-            
-            if include_hourly:
-                weather_main = item['weather'][0]['main']
-                weather_config = WEATHER_CONDITION_MAP.get(weather_main, WEATHER_CONDITION_MAP['Clear'])
-                
-                hourly_forecast.append({
-                    'datetime': dt.isoformat(),
-                    'temperature': round(item['main']['temp'], 1),
-                    'feels_like': round(item['main']['feels_like'], 1),
-                    'weather': {
-                        'main': weather_main,
-                        'description': item['weather'][0]['description'].title(),
-                        'icon': item['weather'][0]['icon'],
-                        'emoji': weather_config['emoji']
-                    },
-                    'humidity': item['main']['humidity'],
-                    'wind_speed': item['wind']['speed'],
-                    'precipitation_probability': round(item.get('pop', 0) * 100),
-                    'clouds': item['clouds']['all']
-                })
-            
-            if date_key not in daily_forecast:
-                daily_forecast[date_key] = {
-                    'date': date_key,
-                    'temps': [],
-                    'weather': item['weather'][0]['main'],
-                    'description': item['weather'][0]['description'].title(),
-                    'icon': item['weather'][0]['icon'],
-                    'humidity': [],
-                    'wind_speed': [],
-                    'pop': [],
-                    'pressure': []
-                }
-            
-            daily_forecast[date_key]['temps'].append(item['main']['temp'])
-            daily_forecast[date_key]['humidity'].append(item['main']['humidity'])
-            daily_forecast[date_key]['wind_speed'].append(item['wind']['speed'])
-            daily_forecast[date_key]['pop'].append(item.get('pop', 0) * 100)
-            daily_forecast[date_key]['pressure'].append(item['main']['pressure'])
-        
-        daily_summary = []
-        for date, forecast in list(daily_forecast.items())[:days]:
-            weather_config = WEATHER_CONDITION_MAP.get(forecast['weather'], WEATHER_CONDITION_MAP['Clear'])
-            
-            daily_summary.append({
-                'date': date,
-                'day_name': datetime.fromisoformat(date).strftime('%A'),
-                'temperature': {
-                    'min': round(min(forecast['temps']), 1),
-                    'max': round(max(forecast['temps']), 1),
-                    'avg': round(sum(forecast['temps']) / len(forecast['temps']), 1)
-                },
-                'weather': {
-                    'main': forecast['weather'],
-                    'description': forecast['description'],
-                    'icon': forecast['icon'],
-                    'emoji': weather_config['emoji']
-                },
-                'humidity': round(sum(forecast['humidity']) / len(forecast['humidity'])),
-                'wind_speed': round(sum(forecast['wind_speed']) / len(forecast['wind_speed']), 1),
-                'precipitation_probability': round(max(forecast['pop'])),
-                'pressure': round(sum(forecast['pressure']) / len(forecast['pressure']))
-            })
-        
-        city_data = data.get('city', {})
-        coord_data = city_data.get('coord', {})
-        
-        result = {
-            'success': True,
-            'location': {
-                'name': city_data.get('name', 'Unknown'),
-                'country': city_data.get('country', 'Unknown'),
-                'coordinates': {
-                    'lat': coord_data.get('lat', lat),
-                    'lon': coord_data.get('lon', lon)
-                }
-            },
-            'daily': daily_summary,
-            'best_time_today': get_best_time_today(data),
-            'unit': '°C' if units == 'metric' else '°F'
-        }
-        
-        if include_hourly:
-            result['hourly'] = hourly_forecast
-        
-        return jsonify(result), 200
-        
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Forecast API error: {e}")
-        return jsonify({'error': 'Forecast service unavailable', 'success': False}), 503
-
-@app.route('/api/weather/alerts', methods=['GET'])
-@limiter.limit("100 per hour")
-def get_weather_alerts():
+@app.route('/api/weather/current', methods=['GET'])
+@limiter.limit("500 per hour")
+def get_current_weather():
     lat = request.args.get('lat', type=float)
     lon = request.args.get('lon', type=float)
     
     if not lat or not lon:
         return jsonify({
-            'success': True,
-            'alerts': [],
-            'count': 0,
-            'has_alerts': False,
-            'message': 'Coordinates required for alerts'
-        }), 200
+            'success': False,
+            'error': 'Coordinates required',
+            'code': 'MISSING_COORDINATES'
+        }), 400
+    
+    cache_key = generate_cache_key('weather_current', round(lat, 2), round(lon, 2))
+    
+    if should_use_cache({'lat': lat, 'lon': lon}, 'weather_current'):
+        cached_weather = get_from_cache(cache_key, 'weather_current')
+        if cached_weather:
+            logger.info(f"Using cached weather for: {lat}, {lon}")
+            cached_weather['cache_hit'] = True
+            cached_weather['timestamp'] = datetime.utcnow().isoformat()
+            return jsonify(cached_weather), 200
     
     try:
-        url = f"https://api.openweathermap.org/data/2.5/onecall?lat={lat}&lon={lon}&exclude=minutely,hourly,daily&appid={OPENWEATHER_API_KEY}"
-        response = requests.get(url, timeout=10)
-        response.raise_for_status()
-        data = response.json()
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        weather_data = loop.run_until_complete(
+            weather_service.get_current_weather_enhanced(lat, lon)
+        )
+        loop.close()
         
-        alerts = data.get('alerts', [])
+        current_hour = datetime.now().hour
+        if 6 <= current_hour < 12:
+            time_period = 'morning'
+        elif 12 <= current_hour < 18:
+            time_period = 'afternoon'
+        elif 18 <= current_hour < 22:
+            time_period = 'evening'
+        else:
+            time_period = 'night'
         
-        formatted_alerts = []
-        for alert in alerts:
-            formatted_alerts.append({
-                'event': alert.get('event'),
-                'severity': 'high' if 'warning' in alert.get('event', '').lower() else 'medium',
-                'start': datetime.fromtimestamp(alert.get('start')).isoformat(),
-                'end': datetime.fromtimestamp(alert.get('end')).isoformat(),
-                'description': alert.get('description'),
-                'sender': alert.get('sender_name'),
-                'tags': alert.get('tags', [])
-            })
+        weather_condition = weather_data['weather']['condition']
+        temperature = weather_data['weather']['temperature']['current']
         
-        return jsonify({
+        comprehensive_insights = get_comprehensive_insights(weather_condition, temperature, time_period)
+        best_time_analysis = calculate_best_time_detailed(None, weather_condition, temperature)
+        
+        enhanced_response = {
             'success': True,
-            'location': {'lat': lat, 'lon': lon},
-            'alerts': formatted_alerts,
-            'count': len(formatted_alerts),
-            'has_alerts': len(formatted_alerts) > 0
-        }), 200
+            'weather': weather_data['weather'],
+            'air_quality': weather_data.get('air_quality'),
+            'health_insights': weather_data.get('health_insights'),
+            'current_time_period': time_period,
+            'comprehensive_insights': {
+                'health_safety': comprehensive_insights['health_safety'],
+                'clothing_recommendations': comprehensive_insights['clothing'],
+                'activity_suggestions': comprehensive_insights['activities'],
+                'spotify_moods': comprehensive_insights['spotify_moods'],
+                'color_palette': comprehensive_insights['color_palette'],
+                'fun_facts': comprehensive_insights['fun_facts']
+            },
+            'best_time_today': best_time_analysis,
+            'location': weather_data['location'],
+            'cache_hit': False,
+            'timestamp': datetime.utcnow().isoformat()
+        }
         
-    except:
+        set_cache(cache_key, enhanced_response, 'weather_current')
+        return jsonify(enhanced_response), 200
+        
+    except Exception as e:
+        logger.error(f"Weather API error: {e}")
         return jsonify({
+            'success': False,
+            'error': 'Weather service unavailable',
+            'code': 'WEATHER_SERVICE_ERROR'
+        }), 503
+
+@app.route('/api/weather/forecast', methods=['GET'])
+@limiter.limit("300 per hour")
+def get_forecast():
+    lat = request.args.get('lat', type=float)
+    lon = request.args.get('lon', type=float)
+    days = request.args.get('days', 7, type=int)
+    
+    if not lat or not lon:
+        return jsonify({
+            'success': False,
+            'error': 'Coordinates required',
+            'code': 'MISSING_COORDINATES'
+        }), 400
+    
+    cache_key = generate_cache_key('weather_forecast', round(lat, 2), round(lon, 2), days)
+    
+    if should_use_cache({'lat': lat, 'lon': lon}, 'weather_forecast'):
+        cached_forecast = get_from_cache(cache_key, 'weather_forecast')
+        if cached_forecast:
+            logger.info(f"Using cached forecast for: {lat}, {lon}")
+            cached_forecast['cache_hit'] = True
+            cached_forecast['timestamp'] = datetime.utcnow().isoformat()
+            return jsonify(cached_forecast), 200
+    
+    try:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        forecast_data = loop.run_until_complete(
+            weather_service.get_forecast_enhanced(lat, lon, days)
+        )
+        loop.close()
+        
+        enhanced_forecast = []
+        for day_forecast in forecast_data['forecast']:
+            condition = day_forecast['condition']
+            temp_avg = day_forecast['temperature']['avg']
+            
+            daily_insights = {}
+            for period in ['morning', 'afternoon', 'evening', 'night']:
+                daily_insights[period] = get_comprehensive_insights(condition, temp_avg, period)
+            
+            enhanced_day = {
+                **day_forecast,
+                'period_insights': daily_insights,
+                'best_period_score': max([
+                    calculate_best_time_detailed(None, condition, temp_avg)['detailed_breakdown'][period]['score']
+                    for period in ['morning', 'afternoon', 'evening', 'night']
+                ])
+            }
+            enhanced_forecast.append(enhanced_day)
+        
+        enhanced_response = {
             'success': True,
-            'alerts': [],
-            'count': 0,
-            'has_alerts': False
-        }), 200
+            'forecast': enhanced_forecast,
+            'best_times': forecast_data.get('best_times', {}),
+            'location': forecast_data['location'],
+            'cache_hit': False,
+            'timestamp': datetime.utcnow().isoformat()
+        }
+        
+        set_cache(cache_key, enhanced_response, 'weather_forecast')
+        return jsonify(enhanced_response), 200
+        
+    except Exception as e:
+        logger.error(f"Forecast API error: {e}")
+        return jsonify({
+            'success': False,
+            'error': 'Forecast service unavailable',
+            'code': 'FORECAST_SERVICE_ERROR'
+        }), 503
 
-@app.route('/api/weather/explore', methods=['GET'])
-@limiter.limit("50 per hour")
-def explore_random_weather():
-    count = request.args.get('count', 6, type=int)
-    count = min(count, 10)
-    units = request.args.get('units', 'metric')
-    
-    cities = random.sample(GLOBAL_CITIES, min(count, len(GLOBAL_CITIES)))
-    results = []
-    
-    for city in cities:
-        url = f"https://api.openweathermap.org/data/2.5/weather?q={city}&units={units}&appid={OPENWEATHER_API_KEY}"
-        try:
-            response = requests.get(url, timeout=5)
-            response.raise_for_status()
-            data = response.json()
-            
-            weather_config = WEATHER_CONDITION_MAP.get(data['weather'][0]['main'], WEATHER_CONDITION_MAP['Clear'])
-            
-            results.append({
-                'city': data['name'],
-                'country': data['sys']['country'],
-                'temperature': round(data['main']['temp'], 1),
-                'feels_like': round(data['main']['feels_like'], 1),
-                'weather': {
-                    'main': data['weather'][0]['main'],
-                    'description': data['weather'][0]['description'].title(),
-                    'icon': data['weather'][0]['icon'],
-                    'emoji': weather_config['emoji']
-                },
-                'coordinates': {
-                    'lat': data['coord']['lat'],
-                    'lon': data['coord']['lon']
-                }
-            })
-        except:
-            continue
-    
-    return jsonify({
-        'success': True,
-        'cities': results,
-        'count': len(results)
-    }), 200
-
-@app.route('/api/insights/fun-fact', methods=['GET'])
-def get_fun_fact():
-    return jsonify({
-        'success': True,
-        'fact': random.choice(WEATHER_FUN_FACTS),
-        'category': 'weather',
-        'total_facts': len(WEATHER_FUN_FACTS),
-        'timestamp': datetime.now(timezone.utc).isoformat()
-    }), 200
-
-@app.route('/api/insights/activities', methods=['GET'])
-def get_activity_suggestions():
+@app.route('/api/insights/comprehensive', methods=['GET'])
+@limiter.limit("300 per hour")
+def get_comprehensive_insights_endpoint():
     weather = request.args.get('weather', 'Clear')
     temp = request.args.get('temp', type=float)
+    time_period = request.args.get('time', 'afternoon')
     
-    weather_config = WEATHER_CONDITION_MAP.get(weather, WEATHER_CONDITION_MAP['Clear'])
-    activities = weather_config['activities'].copy()
+    current_hour = datetime.now().hour
+    if not time_period:
+        if 6 <= current_hour < 12:
+            time_period = 'morning'
+        elif 12 <= current_hour < 18:
+            time_period = 'afternoon'
+        elif 18 <= current_hour < 22:
+            time_period = 'evening'
+        else:
+            time_period = 'night'
     
-    if temp:
-        if temp > 30:
-            activities.extend(['Swimming', 'Water park', 'Ice cream'])
-        elif temp < 5:
-            activities.extend(['Indoor activities', 'Hot beverages'])
+    cache_key = generate_cache_key('insights', weather, temp or 20, time_period)
+    cached_insights = get_from_cache(cache_key, 'insights')
     
-    activities = list(set(activities))
-    suggested = random.sample(activities, min(5, len(activities)))
+    if cached_insights:
+        cached_insights['cache_hit'] = True
+        cached_insights['timestamp'] = datetime.utcnow().isoformat()
+        return jsonify(cached_insights), 200
     
-    return jsonify({
+    insights = get_comprehensive_insights(weather, temp or 20, time_period)
+    best_time = calculate_best_time_detailed(None, weather, temp or 20)
+    
+    response_data = {
         'success': True,
-        'weather': weather,
+        'weather_condition': weather,
         'temperature': temp,
-        'mood': weather_config['mood'],
-        'suggested_activities': suggested,
-        'all_activities': activities,
-        'emoji': weather_config['emoji']
-    }), 200
+        'time_period': time_period,
+        'health_safety': insights['health_safety'],
+        'clothing_recommendations': insights['clothing'],
+        'activity_suggestions': insights['activities'],
+        'spotify_moods': insights['spotify_moods'],
+        'color_palette': insights['color_palette'],
+        'fun_facts': insights['fun_facts'],
+        'best_time_today': best_time,
+        'cache_hit': False,
+        'timestamp': datetime.utcnow().isoformat()
+    }
+    
+    set_cache(cache_key, response_data, 'insights')
+    return jsonify(response_data), 200
 
 @app.route('/api/entertainment/spotify', methods=['GET'])
-@limiter.limit("50 per hour")
+@limiter.limit("200 per hour")
 def get_spotify_playlists():
     weather = request.args.get('weather', 'Clear')
-    limit = request.args.get('limit', 5, type=int)
+    mood = request.args.get('mood', 'happy')
+    time_period = request.args.get('time', 'afternoon')
+    limit = request.args.get('limit', 6, type=int)
     
-    weather_config = WEATHER_CONDITION_MAP.get(weather, WEATHER_CONDITION_MAP['Clear'])
-    playlist_query = weather_config['playlist']
+    cache_key = generate_cache_key('spotify', weather, mood, time_period, limit)
+    cached_playlists = get_from_cache(cache_key, 'spotify')
+    
+    if cached_playlists:
+        cached_playlists['cache_hit'] = True
+        cached_playlists['timestamp'] = datetime.utcnow().isoformat()
+        return jsonify(cached_playlists), 200
+    
+    recommendations = COMPREHENSIVE_RECOMMENDATIONS.get(weather, {}).get(time_period, {})
+    spotify_moods = recommendations.get('spotify_moods', ['chill vibes'])
+    
+    query = random.choice(spotify_moods)
     
     token = get_spotify_token()
     
     if not token:
-        return jsonify({
+        response_data = {
             'success': False,
             'message': 'Spotify service unavailable',
             'weather': weather,
-            'mood': weather_config['mood']
-        }), 200
+            'mood': mood,
+            'time_period': time_period,
+            'suggested_moods': spotify_moods
+        }
+        return jsonify(response_data), 200
     
-    search_url = f"https://api.spotify.com/v1/search?q={playlist_query}&type=playlist&limit={limit}"
+    search_url = f"https://api.spotify.com/v1/search?q={query}&type=playlist&limit={limit}"
     headers = {"Authorization": f"Bearer {token}"}
     
     try:
@@ -1519,20 +1078,29 @@ def get_spotify_playlists():
                 if item:
                     playlists.append({
                         'name': item.get('name', 'Unknown Playlist'),
-                        'description': item.get('description', f'Curated for {weather_config["mood"]} mood'),
+                        'description': item.get('description', f'Perfect for {weather.lower()} {time_period}'),
                         'url': item.get('external_urls', {}).get('spotify', '#'),
                         'image': item.get('images', [{}])[0].get('url') if item.get('images') else None,
                         'tracks': item.get('tracks', {}).get('total', 0),
-                        'owner': item.get('owner', {}).get('display_name', 'Spotify')
+                        'owner': item.get('owner', {}).get('display_name', 'Spotify'),
+                        'followers': item.get('followers', {}).get('total', 0)
                     })
         
-        return jsonify({
+        response_data = {
             'success': True,
             'weather': weather,
-            'mood': weather_config['mood'],
+            'mood': mood,
+            'time_period': time_period,
+            'query_used': query,
+            'suggested_moods': spotify_moods,
             'playlists': playlists,
-            'total_found': len(playlists)
-        }), 200
+            'total_found': len(playlists),
+            'cache_hit': False,
+            'timestamp': datetime.utcnow().isoformat()
+        }
+        
+        set_cache(cache_key, response_data, 'spotify')
+        return jsonify(response_data), 200
         
     except Exception as e:
         logger.error(f"Spotify API error: {e}")
@@ -1540,83 +1108,66 @@ def get_spotify_playlists():
             'success': False,
             'error': 'Spotify service error',
             'weather': weather,
-            'mood': weather_config['mood']
+            'mood': mood,
+            'time_period': time_period
         }), 200
 
-@app.route('/api/entertainment/sounds', methods=['GET'])
-def get_ambient_sounds():
-    weather = request.args.get('weather', 'Clear')
+@app.route('/api/insights/fun-fact', methods=['GET'])
+@limiter.limit("200 per hour")
+def get_fun_fact():
+    category = request.args.get('category', 'weather')
     
-    weather_config = WEATHER_CONDITION_MAP.get(weather, WEATHER_CONDITION_MAP['Clear'])
-    
-    all_sounds = {k: {
-        'url': v['sound'],
-        'mood': v['mood'],
-        'emoji': v['emoji']
-    } for k, v in WEATHER_CONDITION_MAP.items()}
+    selected_fact = random.choice(WEATHER_FUN_FACTS)
     
     return jsonify({
         'success': True,
-        'weather': weather,
-        'mood': weather_config['mood'],
-        'primary_sound': {
-            'url': weather_config['sound'],
-            'description': f"Ambient {weather.lower()} sounds for relaxation"
-        },
-        'all_sounds': all_sounds,
-        'emoji': weather_config['emoji']
+        'fact': selected_fact,
+        'category': category,
+        'total_facts': len(WEATHER_FUN_FACTS),
+        'timestamp': datetime.utcnow().isoformat(),
+        'share_text': f"🌤️ Weather Fact: {selected_fact}"
     }), 200
-
-@app.route('/api/stats', methods=['GET'])
-def get_service_stats():
-    return jsonify({
-        'success': True,
-        'statistics': location_service.get_stats(),
-        'timestamp': datetime.now(timezone.utc).isoformat()
-    }), 200
-
-@app.route('/api/admin/clear-cache', methods=['POST'])
-@limiter.limit("10 per hour")
-def clear_cache():
-    admin_key = request.headers.get('X-Admin-Key')
-    if admin_key != os.getenv('ADMIN_API_KEY', 'default-admin-key'):
-        return jsonify({'error': 'Unauthorized'}), 401
-    
-    location_service.clear_cache()
-    return jsonify({'success': True, 'message': 'Location cache cleared'}), 200
 
 @app.errorhandler(404)
 def not_found(error):
-    return jsonify({'success': False, 'error': 'Endpoint not found', 'code': 404}), 404
+    return jsonify({
+        'success': False,
+        'error': 'Endpoint not found',
+        'code': 404
+    }), 404
 
 @app.errorhandler(500)
 def internal_error(error):
     logger.exception(f"Internal server error: {error}")
-    return jsonify({'success': False, 'error': 'Internal server error', 'code': 500}), 500
+    return jsonify({
+        'success': False,
+        'error': 'Internal server error',
+        'code': 500
+    }), 500
 
 @app.errorhandler(429)
 def ratelimit_handler(e):
-    return jsonify({'success': False, 'error': 'Rate limit exceeded', 'code': 429}), 429
+    return jsonify({
+        'success': False,
+        'error': 'Rate limit exceeded',
+        'code': 429,
+        'retry_after': '60 seconds'
+    }), 429
 
 if __name__ == '__main__':
-    location_service.clear_cache()
-    
     port = int(os.getenv('PORT', 5000))
     debug = os.getenv('FLASK_ENV') == 'development'
     
-    logger.info("=" * 60)
-    logger.info("SkyVibe Weather API v2.1.1")
-    logger.info("=" * 60)
-    logger.info(f"Server running on port {port}")
-    logger.info(f"Debug mode: {debug}")
-    if GOOGLE_MAPS_API_KEY:
-        logger.info("Location Service: GOOGLE MAPS MODE (100% Accuracy)")
-        logger.info("Providers: Google Geocoding API, Nominatim, BigDataCloud, LocationIQ")
-    else:
-        logger.info("Location Service: HIGH ACCURACY MODE")
-        logger.info("Providers: Nominatim, BigDataCloud, LocationIQ")
-    logger.info("Cache: CLEARED on startup")
-    logger.info("NOTE: IP location shows ISP/data center location - use GPS for exact location")
-    logger.info("=" * 60)
+    logger.info("=" * 80)
+    logger.info("🌤️  SkyVibe Weather API v3.2.0 - Production Ready for Render")
+    logger.info("=" * 80)
+    logger.info(f"Server: Running on port {port}")
+    logger.info(f"Environment: {os.getenv('FLASK_ENV', 'production')}")
+    logger.info(f"Cache: {'Redis Active' if redis_client else 'Memory Fallback'}")
+    logger.info("✓ Render Deployment Ready")
+    logger.info("✓ Redis URL Support")
+    logger.info("✓ Production Error Handling")
+    logger.info("✓ Comprehensive Insights & Recommendations")
+    logger.info("=" * 80)
     
     app.run(host='0.0.0.0', port=port, debug=debug)

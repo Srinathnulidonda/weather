@@ -1,4 +1,4 @@
-#backend/app.py
+# backend/app.py
 import os
 import asyncio
 import uuid
@@ -68,7 +68,9 @@ CACHE_TTLS = {
     'location_coords': 7200,
     'insights': 1800,
     'spotify': 3600,
-    'activities': 1800
+    'activities': 1800,
+    'ultra_weather': 900,
+    'ultra_location': 7200
 }
 
 SPATIAL_THRESHOLD = 0.01
@@ -453,7 +455,7 @@ def should_use_cache(location_data, cache_type='weather'):
     
     current_time = time.time()
     
-    if cache_type in ['weather_current', 'weather_forecast']:
+    if cache_type in ['weather_current', 'weather_forecast', 'ultra_weather']:
         lat = location_data.get('lat', 0)
         lon = location_data.get('lon', 0)
         
@@ -683,10 +685,9 @@ def get_spotify_token():
         return None
 
 def clean_expired_requests():
-    """Clean up expired active requests"""
     current_time = time.time()
     expired_keys = [key for key, timestamp in active_location_requests.items() 
-                   if current_time - timestamp > 30]  # 30 second timeout
+                   if current_time - timestamp > 30]
     for key in expired_keys:
         active_location_requests.pop(key, None)
 
@@ -694,10 +695,12 @@ def clean_expired_requests():
 def home():
     return jsonify({
         'service': 'SkyVibe Weather API',
-        'version': '3.2.0',
+        'version': '4.0.0',
         'status': 'operational',
         'environment': os.getenv('FLASK_ENV', 'production'),
         'features': [
+            'Ultra-Accurate Location Detection',
+            'AccuWeather Integration',
             'Comprehensive Time-Based Recommendations',
             'Smart Caching & Request Optimization',
             'Health & Safety Insights',
@@ -715,7 +718,7 @@ def health_check():
     return jsonify({
         'status': 'healthy',
         'service': 'SkyVibe Weather API',
-        'version': '3.2.0',
+        'version': '4.0.0',
         'timestamp': datetime.utcnow().isoformat(),
         'cache_status': 'active' if redis_client else 'memory',
         'environment': os.getenv('FLASK_ENV', 'production')
@@ -730,10 +733,8 @@ def auto_detect_location():
     
     session_id = request.headers.get('X-Session-ID') or str(uuid.uuid4())
     
-    # Clean expired requests
     clean_expired_requests()
     
-    # Check if there's already an active request for this IP
     request_key = f"{ip_address}:{session_id}"
     if request_key in active_location_requests:
         return jsonify({
@@ -743,7 +744,6 @@ def auto_detect_location():
         }), 429
     
     try:
-        # Mark request as active
         active_location_requests[request_key] = time.time()
         
         cache_key = generate_cache_key('location_ip', ip_address)
@@ -829,8 +829,66 @@ def auto_detect_location():
             }), 503
             
     finally:
-        # Always clean up the active request marker
         active_location_requests.pop(request_key, None)
+
+@app.route('/api/location/ultra-accurate', methods=['POST'])
+@limiter.limit("300 per hour")
+def ultra_accurate_location():
+    data = request.get_json() or {}
+    browser_location = data.get('browser_location')
+    session_id = request.headers.get('X-Session-ID') or str(uuid.uuid4())
+    ip_address = request.headers.get('X-Forwarded-For', request.remote_addr)
+    if ip_address:
+        ip_address = ip_address.split(',')[0].strip()
+    
+    cache_key = generate_cache_key('ultra_location', session_id, str(browser_location))
+    cached_result = get_from_cache(cache_key, 'ultra_location')
+    
+    if cached_result:
+        cached_result['cache_hit'] = True
+        cached_result['timestamp'] = datetime.utcnow().isoformat()
+        return jsonify(cached_result), 200
+    
+    try:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        location = loop.run_until_complete(
+            location_service.get_ultra_accurate_location(
+                ip_address=ip_address,
+                session_id=session_id,
+                browser_location=browser_location
+            )
+        )
+        loop.close()
+        
+        greeting = get_greeting()
+        moon = get_moon_phase()
+        full_location = location_service.format_full_location(location)
+        
+        response_data = {
+            'success': True,
+            'location': location.__dict__,
+            'display_location': full_location,
+            'greeting': greeting,
+            'moon_phase': moon,
+            'accuracy_score': f"{location.accuracy:.2%}",
+            'confidence_score': f"{location.confidence:.2%}",
+            'method': location.provider,
+            'session_id': session_id,
+            'cache_hit': False,
+            'timestamp': datetime.utcnow().isoformat()
+        }
+        
+        set_cache(cache_key, response_data, 'ultra_location')
+        return jsonify(response_data), 200
+        
+    except Exception as e:
+        logger.error(f"Ultra location error: {e}")
+        return jsonify({
+            'success': False,
+            'error': str(e),
+            'code': 'ULTRA_LOCATION_ERROR'
+        }), 503
 
 @app.route('/api/weather/current', methods=['GET'])
 @limiter.limit("500 per hour")
@@ -908,6 +966,50 @@ def get_current_weather():
             'success': False,
             'error': 'Weather service unavailable',
             'code': 'WEATHER_SERVICE_ERROR'
+        }), 503
+
+@app.route('/api/weather/ultra-analysis', methods=['GET'])
+@limiter.limit("300 per hour")
+def ultra_weather_analysis():
+    lat = request.args.get('lat', type=float)
+    lon = request.args.get('lon', type=float)
+    
+    if not lat or not lon:
+        return jsonify({
+            'success': False,
+            'error': 'Coordinates required',
+            'code': 'MISSING_COORDINATES'
+        }), 400
+    
+    cache_key = generate_cache_key('ultra_weather', round(lat, 2), round(lon, 2))
+    
+    if should_use_cache({'lat': lat, 'lon': lon}, 'ultra_weather'):
+        cached_analysis = get_from_cache(cache_key, 'ultra_weather')
+        if cached_analysis:
+            logger.info(f"Using cached ultra weather analysis for: {lat}, {lon}")
+            cached_analysis['cache_hit'] = True
+            cached_analysis['timestamp'] = datetime.utcnow().isoformat()
+            return jsonify(cached_analysis), 200
+    
+    try:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        weather_analysis = loop.run_until_complete(
+            weather_service.get_ultra_weather_analysis(lat, lon)
+        )
+        loop.close()
+        
+        weather_analysis['cache_hit'] = False
+        set_cache(cache_key, weather_analysis, 'ultra_weather')
+        
+        return jsonify(weather_analysis), 200
+        
+    except Exception as e:
+        logger.error(f"Ultra weather analysis error: {e}")
+        return jsonify({
+            'success': False,
+            'error': 'Ultra weather analysis service unavailable',
+            'code': 'ULTRA_WEATHER_ERROR'
         }), 503
 
 @app.route('/api/weather/forecast', methods=['GET'])
@@ -1159,15 +1261,14 @@ if __name__ == '__main__':
     debug = os.getenv('FLASK_ENV') == 'development'
     
     logger.info("=" * 80)
-    logger.info("🌤️  SkyVibe Weather API v3.2.0 - Production Ready for Render")
+    logger.info("🌤️  SkyVibe Weather API v4.0.0 - Ultra Accurate Edition")
     logger.info("=" * 80)
     logger.info(f"Server: Running on port {port}")
     logger.info(f"Environment: {os.getenv('FLASK_ENV', 'production')}")
     logger.info(f"Cache: {'Redis Active' if redis_client else 'Memory Fallback'}")
-    logger.info("✓ Render Deployment Ready")
-    logger.info("✓ Redis URL Support")
-    logger.info("✓ Production Error Handling")
-    logger.info("✓ Comprehensive Insights & Recommendations")
+    logger.info("✓ Ultra-Accurate Location Detection")
+    logger.info("✓ AccuWeather Integration Ready")
+    logger.info("✓ Production-Ready Performance")
     logger.info("=" * 80)
     
     app.run(host='0.0.0.0', port=port, debug=debug)

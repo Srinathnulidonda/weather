@@ -355,7 +355,7 @@ class UltraAccurateLocationService:
             'extratags': 1,
             'namedetails': 1
         }
-        headers = {'User-Agent': 'SkyVibeWeatherApp/4.0'}
+        headers = {'User-Agent': 'NimbusApp/1.2'}
         
         async with aiohttp.ClientSession() as session:
             async with session.get(url, params=params, headers=headers, timeout=10) as response:
@@ -859,7 +859,7 @@ class UltraAccurateLocationService:
             'limit': 5,
             'accept-language': 'en'
         }
-        headers = {'User-Agent': 'SkyVibeWeatherApp/4.0'}
+        headers = {'User-Agent': 'NimbusApp/1.2'}
         
         results = []
         
@@ -975,7 +975,7 @@ class UltraAccurateLocationService:
             'format': 'json',
             'addressdetails': 1
         }
-        headers = {'User-Agent': 'SkyVibeWeatherApp/4.0'}
+        headers = {'User-Agent': 'NimbusApp/1.2'}
         
         async with aiohttp.ClientSession() as session:
             async with session.get(url, params=params, headers=headers, timeout=5) as response:

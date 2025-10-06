@@ -790,7 +790,7 @@ async def get_location_details():
 @app.route('/', methods=['GET'])
 def home():
     return jsonify({
-        'service': 'SkyVibe Weather API',
+        'service': 'Nimbus API',
         'version': '4.0.0',
         'status': 'operational',
         'environment': os.getenv('FLASK_ENV', 'production'),
@@ -813,7 +813,7 @@ def home():
 def health_check():
     return jsonify({
         'status': 'healthy',
-        'service': 'SkyVibe Weather API',
+        'service': 'Nimbus API',
         'version': '4.0.0',
         'timestamp': datetime.utcnow().isoformat(),
         'cache_status': 'active' if redis_client else 'memory',
@@ -1357,7 +1357,7 @@ if __name__ == '__main__':
     debug = os.getenv('FLASK_ENV') == 'development'
     
     logger.info("=" * 80)
-    logger.info("🌤️  SkyVibe Weather API v4.0.0 - Ultra Accurate Edition")
+    logger.info("🌤️  Nimbus API v1.2")
     logger.info("=" * 80)
     logger.info(f"Server: Running on port {port}")
     logger.info(f"Environment: {os.getenv('FLASK_ENV', 'production')}")

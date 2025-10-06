@@ -4,10 +4,16 @@ import requests
 import logging
 import asyncio
 import aiohttp
-from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Tuple
-from dataclasses import dataclass
+import hashlib
+import time
 import json
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional, Tuple, Set
+from dataclasses import dataclass, asdict
+import redis
+from functools import wraps
+from collections import defaultdict
+import uuid
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +35,7 @@ class WeatherData:
     precipitation: float = 0.0
     precipitation_probability: int = 0
     dew_point: float = 0.0
+    etag: Optional[str] = None
 
 @dataclass
 class AirQualityData:
@@ -41,6 +48,7 @@ class AirQualityData:
     co: float
     so2: float
     health_recommendation: str = ""
+    etag: Optional[str] = None
 
 @dataclass
 class HealthInsights:
@@ -54,12 +62,316 @@ class HealthInsights:
     hydration_advice: str
     exercise_advice: str
 
+@dataclass
+class RequestMetadata:
+    request_id: str
+    timestamp: float
+    location_hash: str
+    etag: Optional[str] = None
+    cache_ttl: int = 600
+
+class RateLimiter:
+    def __init__(self):
+        self.calls = defaultdict(list)
+        self.limits = {
+            'accuweather': {'calls': 50, 'window': 3600},
+            'tomorrow': {'calls': 1000, 'window': 3600},
+            'visual_crossing': {'calls': 1000, 'window': 86400},
+            'openweather': {'calls': 1000, 'window': 3600}
+        }
+    
+    def can_make_request(self, provider: str) -> bool:
+        current_time = time.time()
+        limit_info = self.limits.get(provider, {'calls': 100, 'window': 3600})
+        
+        cutoff_time = current_time - limit_info['window']
+        self.calls[provider] = [call_time for call_time in self.calls[provider] 
+                               if call_time > cutoff_time]
+        
+        return len(self.calls[provider]) < limit_info['calls']
+    
+    def record_call(self, provider: str):
+        self.calls[provider].append(time.time())
+
+class CircuitBreaker:
+    def __init__(self, failure_threshold: int = 5, recovery_timeout: int = 60):
+        self.failure_threshold = failure_threshold
+        self.recovery_timeout = recovery_timeout
+        self.failure_count = defaultdict(int)
+        self.last_failure_time = defaultdict(float)
+        self.state = defaultdict(lambda: 'closed')
+    
+    def can_execute(self, provider: str) -> bool:
+        if self.state[provider] == 'closed':
+            return True
+        elif self.state[provider] == 'open':
+            if time.time() - self.last_failure_time[provider] > self.recovery_timeout:
+                self.state[provider] = 'half-open'
+                return True
+            return False
+        else:
+            return True
+    
+    def record_success(self, provider: str):
+        self.failure_count[provider] = 0
+        self.state[provider] = 'closed'
+    
+    def record_failure(self, provider: str):
+        self.failure_count[provider] += 1
+        self.last_failure_time[provider] = time.time()
+        
+        if self.failure_count[provider] >= self.failure_threshold:
+            self.state[provider] = 'open'
+
+class RequestDeduplicator:
+    def __init__(self):
+        self.pending_requests = {}
+        self.lock = asyncio.Lock()
+    
+    async def deduplicate_request(self, key: str, request_func):
+        async with self.lock:
+            if key in self.pending_requests:
+                return await self.pending_requests[key]
+            
+            future = asyncio.create_task(request_func())
+            self.pending_requests[key] = future
+            
+            try:
+                result = await future
+                return result
+            finally:
+                self.pending_requests.pop(key, None)
+
+class SmartActivityRecommendations:
+    def __init__(self):
+        self.activity_time_windows = {
+            'outdoor_yoga': {'start': 6, 'end': 10, 'ideal': [6, 7, 8, 9]},
+            'jogging': {'start': 5, 'end': 22, 'ideal': [6, 7, 8, 17, 18, 19]},
+            'cycling': {'start': 6, 'end': 20, 'ideal': [7, 8, 9, 17, 18]},
+            'hiking': {'start': 6, 'end': 18, 'ideal': [7, 8, 9, 10]},
+            'outdoor_exercise': {'start': 6, 'end': 20, 'ideal': [7, 8, 9, 17, 18]},
+            'team_sports': {'start': 8, 'end': 20, 'ideal': [9, 10, 16, 17, 18]},
+            'running': {'start': 5, 'end': 22, 'ideal': [6, 7, 8, 17, 18, 19]},
+            'swimming': {'start': 8, 'end': 20, 'ideal': [10, 11, 12, 13, 14, 15]},
+            'water_sports': {'start': 9, 'end': 18, 'ideal': [10, 11, 12, 13, 14]},
+            'beach_activities': {'start': 8, 'end': 19, 'ideal': [9, 10, 11, 16, 17]},
+            'outdoor_dining': {'start': 8, 'end': 23, 'ideal': [12, 13, 18, 19, 20]},
+            'picnic': {'start': 10, 'end': 18, 'ideal': [11, 12, 13, 14, 15]},
+            'barbecue': {'start': 11, 'end': 21, 'ideal': [17, 18, 19, 20]},
+            'outdoor_events': {'start': 9, 'end': 22, 'ideal': [10, 11, 16, 17, 18]},
+            'social_gatherings': {'start': 10, 'end': 23, 'ideal': [11, 17, 18, 19, 20]},
+            'festivals': {'start': 10, 'end': 22, 'ideal': [11, 12, 16, 17, 18]},
+            'walking': {'start': 6, 'end': 22, 'ideal': [7, 8, 17, 18, 19]},
+            'light_walks': {'start': 6, 'end': 21, 'ideal': [7, 8, 18, 19]},
+            'dog_walking': {'start': 6, 'end': 22, 'ideal': [7, 8, 17, 18, 19]},
+            'sightseeing': {'start': 8, 'end': 19, 'ideal': [9, 10, 11, 16, 17]},
+            'photography': {'start': 5, 'end': 21, 'ideal': [6, 7, 17, 18, 19]},
+            'gardening': {'start': 6, 'end': 18, 'ideal': [7, 8, 9, 16, 17]},
+            'outdoor_work': {'start': 7, 'end': 17, 'ideal': [8, 9, 10, 15, 16]},
+            'shopping': {'start': 8, 'end': 22, 'ideal': [10, 11, 14, 15, 16]},
+            'outdoor_markets': {'start': 8, 'end': 16, 'ideal': [9, 10, 11, 12]},
+            'stargazing': {'start': 20, 'end': 5, 'ideal': [21, 22, 23, 0, 1]},
+            'night_walks': {'start': 19, 'end': 23, 'ideal': [19, 20, 21]},
+            'evening_strolls': {'start': 17, 'end': 22, 'ideal': [18, 19, 20]},
+            'outdoor_concerts': {'start': 17, 'end': 23, 'ideal': [19, 20, 21]},
+            'indoor_exercise': {'start': 0, 'end': 24, 'ideal': [6, 7, 8, 17, 18, 19]},
+            'gym_workout': {'start': 5, 'end': 23, 'ideal': [6, 7, 8, 17, 18, 19]},
+            'yoga_studio': {'start': 6, 'end': 22, 'ideal': [7, 8, 9, 17, 18, 19]},
+            'indoor_sports': {'start': 6, 'end': 23, 'ideal': [8, 9, 17, 18, 19]},
+            'shopping_malls': {'start': 9, 'end': 22, 'ideal': [10, 11, 14, 15, 16]},
+            'museums': {'start': 9, 'end': 18, 'ideal': [10, 11, 14, 15, 16]},
+            'movie_theaters': {'start': 10, 'end': 23, 'ideal': [14, 15, 19, 20, 21]},
+            'restaurants': {'start': 11, 'end': 23, 'ideal': [12, 13, 18, 19, 20]},
+            'cafes': {'start': 7, 'end': 22, 'ideal': [8, 9, 10, 14, 15, 16]},
+            'libraries': {'start': 8, 'end': 20, 'ideal': [9, 10, 14, 15, 16]},
+            'art_galleries': {'start': 10, 'end': 18, 'ideal': [11, 12, 14, 15, 16]},
+            'reading': {'start': 0, 'end': 24, 'ideal': [8, 9, 14, 15, 20, 21, 22]},
+            'meditation': {'start': 0, 'end': 24, 'ideal': [6, 7, 8, 20, 21, 22]},
+            'relaxation': {'start': 0, 'end': 24, 'ideal': [14, 15, 20, 21, 22]},
+            'sleep': {'start': 21, 'end': 8, 'ideal': [22, 23, 0, 1, 2, 3, 4, 5, 6, 7]},
+            'nap': {'start': 13, 'end': 16, 'ideal': [14, 15]},
+        }
+        
+        self.safety_considerations = {
+            'night': {
+                'avoid_activities': ['hiking', 'cycling', 'outdoor_exercise', 'jogging', 'team_sports'],
+                'safety_tips': ['Use proper lighting', 'Stay in well-lit areas', 'Inform someone of your plans'],
+                'preferred_activities': ['indoor_activities', 'reading', 'relaxation', 'sleep']
+            },
+            'early_morning': {
+                'considerations': ['Limited daylight', 'Lower temperatures', 'Fewer people around'],
+                'safety_tips': ['Wear reflective clothing', 'Use lights', 'Choose familiar routes']
+            },
+            'late_evening': {
+                'considerations': ['Decreasing visibility', 'Traffic concerns'],
+                'safety_tips': ['Be visible', 'Stay alert', 'Choose safe routes']
+            }
+        }
+        
+        self.weather_activity_modifiers = {
+            'Rain': {
+                'force_indoor': True,
+                'avoid_all_outdoor': True,
+                'preferred': ['indoor_exercise', 'museums', 'shopping_malls', 'movie_theaters', 'reading', 'cafes']
+            },
+            'Thunderstorm': {
+                'force_indoor': True,
+                'avoid_all_outdoor': True,
+                'urgent_indoor': True,
+                'preferred': ['indoor_activities', 'reading', 'relaxation', 'sleep']
+            },
+            'Snow': {
+                'limit_outdoor': True,
+                'cold_weather_only': ['skiing', 'snowboarding', 'snow_activities'],
+                'avoid': ['cycling', 'outdoor_exercise', 'water_activities']
+            },
+            'Clear': {
+                'boost_outdoor': True,
+                'ideal_for': ['outdoor_exercise', 'hiking', 'cycling', 'photography']
+            },
+            'Clouds': {
+                'good_for_all': True,
+                'ideal_for': ['outdoor_exercise', 'walking', 'sightseeing']
+            }
+        }
+    
+    def get_time_appropriate_activities(self, current_hour: int, weather_condition: str, 
+                                      temperature: float, wind_speed: float) -> Dict:
+        appropriate_activities = {
+            'highly_recommended': [],
+            'suitable': [],
+            'indoor_alternatives': [],
+            'avoid': [],
+            'safety_considerations': []
+        }
+        
+        weather_mods = self.weather_activity_modifiers.get(weather_condition, {})
+        
+        if weather_mods.get('force_indoor') or weather_mods.get('urgent_indoor'):
+            appropriate_activities['highly_recommended'] = [
+                'indoor_exercise', 'reading', 'relaxation', 'cafes', 'shopping_malls'
+            ]
+            appropriate_activities['avoid'] = ['All outdoor activities due to weather']
+            appropriate_activities['safety_considerations'] = ['Stay indoors for safety']
+            return appropriate_activities
+        
+        for activity, time_window in self.activity_time_windows.items():
+            is_time_appropriate = self._is_activity_time_appropriate(activity, current_hour, time_window)
+            is_weather_appropriate = self._is_activity_weather_appropriate(activity, weather_condition, temperature, wind_speed)
+            
+            if is_time_appropriate and is_weather_appropriate:
+                if current_hour in time_window.get('ideal', []):
+                    appropriate_activities['highly_recommended'].append(activity)
+                else:
+                    appropriate_activities['suitable'].append(activity)
+            elif not is_time_appropriate and activity.startswith('indoor'):
+                appropriate_activities['indoor_alternatives'].append(activity)
+            elif not is_time_appropriate or not is_weather_appropriate:
+                appropriate_activities['avoid'].append(activity)
+        
+        safety_notes = self._get_safety_considerations(current_hour, weather_condition)
+        appropriate_activities['safety_considerations'] = safety_notes
+        
+        appropriate_activities['highly_recommended'] = appropriate_activities['highly_recommended'][:6]
+        appropriate_activities['suitable'] = appropriate_activities['suitable'][:8]
+        appropriate_activities['indoor_alternatives'] = appropriate_activities['indoor_alternatives'][:5]
+        
+        return appropriate_activities
+    
+    def _is_activity_time_appropriate(self, activity: str, current_hour: int, time_window: Dict) -> bool:
+        start_hour = time_window['start']
+        end_hour = time_window['end']
+        
+        if start_hour > end_hour:
+            return current_hour >= start_hour or current_hour <= end_hour
+        else:
+            return start_hour <= current_hour <= end_hour
+    
+    def _is_activity_weather_appropriate(self, activity: str, condition: str, temp: float, wind: float) -> bool:
+        if 'indoor' in activity:
+            return True
+        
+        if temp < -5 and activity in ['swimming', 'water_sports', 'beach_activities']:
+            return False
+        
+        if temp > 35 and activity in ['jogging', 'hiking', 'outdoor_exercise', 'cycling']:
+            return False
+        
+        if wind > 30 and activity in ['cycling', 'outdoor_yoga', 'picnic']:
+            return False
+        
+        if condition in ['Rain', 'Thunderstorm'] and not activity.startswith('indoor'):
+            return False
+        
+        if condition == 'Snow' and activity in ['swimming', 'water_sports', 'beach_activities']:
+            return False
+        
+        return True
+    
+    def _get_safety_considerations(self, current_hour: int, weather_condition: str) -> List[str]:
+        considerations = []
+        
+        if 22 <= current_hour or current_hour <= 5:
+            considerations.extend([
+                'Use proper lighting if going outside',
+                'Stay in well-lit, familiar areas',
+                'Inform someone of your plans',
+                'Consider indoor alternatives for safety'
+            ])
+        elif 5 <= current_hour <= 7:
+            considerations.extend([
+                'Limited daylight - use reflective clothing',
+                'Be extra cautious of traffic',
+                'Warm up properly in cool temperatures'
+            ])
+        
+        if weather_condition == 'Rain':
+            considerations.extend([
+                'Watch for slippery surfaces',
+                'Use waterproof gear if going outside',
+                'Drive carefully if traveling'
+            ])
+        elif weather_condition == 'Thunderstorm':
+            considerations.extend([
+                'Stay indoors for safety',
+                'Avoid electrical equipment',
+                'Stay away from windows'
+            ])
+        elif weather_condition == 'Snow':
+            considerations.extend([
+                'Dress warmly in layers',
+                'Be cautious of icy surfaces',
+                'Allow extra travel time'
+            ])
+        
+        return considerations[:4]
+
 class UltraWeatherService:
     def __init__(self):
         self.accuweather_api_key = os.getenv('ACCUWEATHER_API_KEY')
         self.tomorrow_api_key = os.getenv('TOMORROW_API_KEY')
         self.visual_crossing_api_key = os.getenv('VISUAL_CROSSING_API_KEY')
         self.openweather_api_key = os.getenv('OPENWEATHER_API_KEY')
+        
+        self.rate_limiter = RateLimiter()
+        self.circuit_breaker = CircuitBreaker()
+        self.request_deduplicator = RequestDeduplicator()
+        self.activity_recommender = SmartActivityRecommendations()
+        
+        self.redis_client = self._setup_redis()
+        self.memory_cache = {}
+        
+        self.spatial_threshold = 0.01
+        self.temporal_threshold = 300
+        self.cache_ttls = {
+            'current_weather': 300,
+            'forecast': 1800,
+            'air_quality': 600,
+            'location_weather': 900,
+        }
+        
+        self.active_requests = set()
+        self.request_history = defaultdict(list)
         
         self.provider_priority = ['accuweather', 'tomorrow', 'visual_crossing', 'openweather']
         
@@ -72,705 +384,163 @@ class UltraWeatherService:
             'evening': (19, 22),
             'night': (22, 4)
         }
+    
+    def _setup_redis(self):
+        try:
+            redis_url = os.getenv('REDIS_URL')
+            if redis_url:
+                client = redis.from_url(redis_url, decode_responses=True, socket_connect_timeout=5)
+            else:
+                client = redis.Redis(
+                    host=os.getenv('REDIS_HOST', 'localhost'),
+                    port=int(os.getenv('REDIS_PORT', 6379)),
+                    db=1,
+                    decode_responses=True,
+                    socket_connect_timeout=5
+                )
+            client.ping()
+            logger.info("Redis connected for weather caching")
+            return client
+        except Exception as e:
+            logger.warning(f"Redis not available for weather caching: {e}")
+            return None
+    
+    def _generate_cache_key(self, prefix: str, lat: float, lon: float, **kwargs) -> str:
+        rounded_lat = round(lat, 3)
+        rounded_lon = round(lon, 3)
         
-        self.weather_recommendations = {
-            'Clear': {
-                'morning': {
-                    'activities': ['Jogging', 'Cycling', 'Outdoor yoga', 'Hiking'],
-                    'clothing': ['Light athletic wear', 'Sunglasses', 'Cap'],
-                    'health_tips': ['Apply sunscreen', 'Stay hydrated', 'Perfect for exercise']
-                },
-                'afternoon': {
-                    'activities': ['Swimming', 'Indoor activities', 'Shopping'],
-                    'clothing': ['Light clothing', 'Sun hat', 'UV protection'],
-                    'health_tips': ['Seek shade', 'Increase water intake', 'Avoid prolonged exposure']
-                },
-                'evening': {
-                    'activities': ['Walking', 'Outdoor dining', 'Social gatherings'],
-                    'clothing': ['Light layers', 'Comfortable wear'],
-                    'health_tips': ['Perfect time for exercise', 'Stay visible']
-                },
-                'night': {
-                    'activities': ['Stargazing', 'Peaceful walks', 'Reading'],
-                    'clothing': ['Light jacket', 'Comfortable wear'],
-                    'health_tips': ['Use proper lighting', 'Dress for temperature drop']
-                }
-            },
-            'Clouds': {
-                'morning': {
-                    'activities': ['Running', 'Cycling', 'Any outdoor activity'],
-                    'clothing': ['Comfortable layers', 'Athletic wear'],
-                    'health_tips': ['Perfect conditions for exercise']
-                },
-                'afternoon': {
-                    'activities': ['Outdoor exploration', 'Sports', 'Walking'],
-                    'clothing': ['Casual layers', 'Comfortable clothing'],
-                    'health_tips': ['Ideal conditions for activities']
-                },
-                'evening': {
-                    'activities': ['Social gatherings', 'Walking', 'Events'],
-                    'clothing': ['Light layers', 'Casual options'],
-                    'health_tips': ['Excellent conditions']
-                },
-                'night': {
-                    'activities': ['Indoor activities', 'Relaxation'],
-                    'clothing': ['Comfortable layers', 'Cozy wear'],
-                    'health_tips': ['Good sleeping conditions']
-                }
-            },
-            'Rain': {
-                'morning': {
-                    'activities': ['Indoor exercise', 'Café visits', 'Reading'],
-                    'clothing': ['Waterproof jacket', 'Rain boots', 'Umbrella'],
-                    'health_tips': ['Stay dry', 'Watch for slippery surfaces']
-                },
-                'afternoon': {
-                    'activities': ['Indoor shopping', 'Museums', 'Movies'],
-                    'clothing': ['Rain gear', 'Waterproof clothing'],
-                    'health_tips': ['Drive carefully', 'Stay warm']
-                },
-                'evening': {
-                    'activities': ['Home activities', 'Reading', 'Movies'],
-                    'clothing': ['Cozy indoor wear', 'Warm layers'],
-                    'health_tips': ['Stay indoors for comfort']
-                },
-                'night': {
-                    'activities': ['Sleeping', 'Reading', 'Relaxation'],
-                    'clothing': ['Cozy pajamas', 'Warm layers'],
-                    'health_tips': ['Perfect sleeping weather']
-                }
-            },
-            'Drizzle': {
-                'morning': {
-                    'activities': ['Light indoor activities', 'Coffee shops'],
-                    'clothing': ['Light rain jacket', 'Comfortable shoes'],
-                    'health_tips': ['Light protection needed']
-                },
-                'afternoon': {
-                    'activities': ['Indoor venues', 'Shopping', 'Museums'],
-                    'clothing': ['Light layers', 'Water-resistant clothing'],
-                    'health_tips': ['Stay comfortable']
-                },
-                'evening': {
-                    'activities': ['Indoor dining', 'Home activities'],
-                    'clothing': ['Comfortable indoor wear'],
-                    'health_tips': ['Cozy evening indoors']
-                },
-                'night': {
-                    'activities': ['Rest', 'Sleep', 'Relaxation'],
-                    'clothing': ['Comfortable sleepwear'],
-                    'health_tips': ['Good for sleep']
-                }
-            },
-            'Snow': {
-                'morning': {
-                    'activities': ['Snow sports', 'Indoor activities'],
-                    'clothing': ['Heavy winter gear', 'Waterproof boots'],
-                    'health_tips': ['Layer properly', 'Stay warm']
-                },
-                'afternoon': {
-                    'activities': ['Indoor activities', 'Hot beverages'],
-                    'clothing': ['Winter coat', 'Warm layers'],
-                    'health_tips': ['Limit exposure', 'Stay warm']
-                },
-                'evening': {
-                    'activities': ['Indoor activities', 'Cozy home time'],
-                    'clothing': ['Warm indoor clothing'],
-                    'health_tips': ['Stay indoors']
-                },
-                'night': {
-                    'activities': ['Sleep', 'Rest'],
-                    'clothing': ['Warm pajamas', 'Extra blankets'],
-                    'health_tips': ['Keep warm']
-                }
-            },
-            'Thunderstorm': {
-                'morning': {
-                    'activities': ['Stay indoors', 'Postpone outdoor plans'],
-                    'clothing': ['Indoor comfortable wear'],
-                    'health_tips': ['Avoid outdoor activities', 'Stay safe']
-                },
-                'afternoon': {
-                    'activities': ['Indoor only', 'Safe shelter'],
-                    'clothing': ['Comfortable indoor clothing'],
-                    'health_tips': ['Stay away from windows', 'Unplug electronics']
-                },
-                'evening': {
-                    'activities': ['Indoor activities only'],
-                    'clothing': ['Comfortable wear'],
-                    'health_tips': ['Monitor weather updates']
-                },
-                'night': {
-                    'activities': ['Sleep', 'Stay indoors'],
-                    'clothing': ['Comfortable sleepwear'],
-                    'health_tips': ['Stay safe indoors']
-                }
-            },
-            'Mist': {
-                'morning': {
-                    'activities': ['Light activities', 'Short walks'],
-                    'clothing': ['Visibility gear', 'Light layers'],
-                    'health_tips': ['Drive carefully', 'Use lights']
-                },
-                'afternoon': {
-                    'activities': ['Indoor preferred', 'Short trips'],
-                    'clothing': ['Comfortable layers'],
-                    'health_tips': ['Be visible']
-                },
-                'evening': {
-                    'activities': ['Indoor activities'],
-                    'clothing': ['Warm layers'],
-                    'health_tips': ['Limited visibility']
-                },
-                'night': {
-                    'activities': ['Stay indoors'],
-                    'clothing': ['Comfortable wear'],
-                    'health_tips': ['Avoid travel']
-                }
-            }
-        }
+        key_parts = [prefix, f"{rounded_lat},{rounded_lon}"]
+        for k, v in sorted(kwargs.items()):
+            key_parts.append(f"{k}:{v}")
         
-        self.ultra_recommendations = {
-            'Clear': {
-                'early_morning': {
-                    'health_safety': {
-                        'uv_warning': 'Minimal UV - perfect for sunrise activities',
-                        'air_quality': 'Excellent - fresh morning air',
-                        'heat_stress': 'No risk - optimal temperature',
-                        'safety_tips': ['Perfect for outdoor exercise', 'Great visibility', 'Cool and refreshing'],
-                        'health_benefits': ['Vitamin D synthesis beginning', 'Fresh oxygen levels', 'Natural energy boost']
-                    },
-                    'clothing': {
-                        'recommended': ['Light athletic wear', 'Moisture-wicking fabrics', 'Light jacket for warmth'],
-                        'avoid': ['Heavy clothing', 'Non-breathable materials'],
-                        'accessories': ['Water bottle', 'Fitness tracker', 'Light cap'],
-                        'footwear': ['Running shoes', 'Athletic socks', 'Comfortable sneakers']
-                    },
-                    'activities': {
-                        'highly_recommended': ['Sunrise jogging', 'Meditation', 'Yoga', 'Photography', 'Walking'],
-                        'suitable': ['Cycling', 'Outdoor stretching', 'Morning coffee outside'],
-                        'avoid': ['Heavy workouts without warmup', 'Intense sun exposure'],
-                        'energy_level': 'Building - perfect for gentle start'
-                    },
-                    'spotify_moods': ['morning meditation', 'sunrise acoustic', 'peaceful piano', 'nature sounds'],
-                    'color_palette': ['#FFE5B4', '#FFEFD5', '#F0E68C', '#87CEEB', '#B0E0E6'],
-                    'comfort_factors': {
-                        'temperature_comfort': 9,
-                        'humidity_comfort': 9,
-                        'wind_comfort': 8,
-                        'overall_comfort': 9
-                    }
-                },
-                'morning': {
-                    'health_safety': {
-                        'uv_warning': 'Low to moderate UV - light protection recommended',
-                        'air_quality': 'Excellent conditions for outdoor activities',
-                        'heat_stress': 'Minimal risk - perfect exercise window',
-                        'safety_tips': ['Apply light sunscreen', 'Stay hydrated', 'Perfect for cardio'],
-                        'health_benefits': ['Peak vitamin D synthesis', 'Optimal air quality', 'Energy and mood boost']
-                    },
-                    'clothing': {
-                        'recommended': ['Athletic wear', 'Breathable fabrics', 'Light sun protection', 'Comfortable layers'],
-                        'avoid': ['Heavy layers', 'Dark heat-absorbing colors', 'Non-breathable materials'],
-                        'accessories': ['Sunglasses', 'Water bottle', 'Sunscreen SPF 30+', 'Sweat towel'],
-                        'footwear': ['Running shoes', 'Breathable sneakers', 'Moisture-wicking socks']
-                    },
-                    'activities': {
-                        'highly_recommended': ['Jogging', 'Cycling', 'Outdoor yoga', 'Hiking', 'Team sports'],
-                        'suitable': ['Walking', 'Gardening', 'Outdoor dining', 'Photography'],
-                        'avoid': ['Prolonged direct sun without protection'],
-                        'energy_level': 'High - ideal for active pursuits'
-                    },
-                    'spotify_moods': ['workout motivation', 'upbeat pop', 'energetic indie', 'morning pump-up'],
-                    'color_palette': ['#FFD700', '#FFA500', '#87CEEB', '#00BFFF', '#32CD32'],
-                    'comfort_factors': {
-                        'temperature_comfort': 10,
-                        'humidity_comfort': 9,
-                        'wind_comfort': 9,
-                        'overall_comfort': 10
-                    }
-                },
-                'late_morning': {
-                    'health_safety': {
-                        'uv_warning': 'Moderate UV - protection advised',
-                        'air_quality': 'Good conditions, monitor in urban areas',
-                        'heat_stress': 'Low to moderate risk',
-                        'safety_tips': ['Seek shade periodically', 'Hydrate regularly', 'Protect skin'],
-                        'health_benefits': ['Good for vitamin D', 'Active metabolism', 'High alertness']
-                    },
-                    'clothing': {
-                        'recommended': ['Light clothing', 'UV protection', 'Breathable materials', 'Hat'],
-                        'avoid': ['Dark colors', 'Heavy fabrics', 'Tight clothing'],
-                        'accessories': ['Sunglasses', 'Sunscreen', 'Water bottle', 'Light scarf'],
-                        'footwear': ['Comfortable shoes', 'Breathable options', 'Light socks']
-                    },
-                    'activities': {
-                        'highly_recommended': ['Brunch outdoors', 'Light shopping', 'Sightseeing', 'Photography'],
-                        'suitable': ['Walking', 'Casual sports', 'Gardening', 'Outdoor markets'],
-                        'avoid': ['Intense physical activity', 'Extended sun exposure'],
-                        'energy_level': 'Moderate to high - transitioning period'
-                    },
-                    'spotify_moods': ['brunch vibes', 'feel-good hits', 'sunny day playlist', 'acoustic pop'],
-                    'color_palette': ['#FDB813', '#FFCC00', '#FFE135', '#F0E68C', '#87CEEB'],
-                    'comfort_factors': {
-                        'temperature_comfort': 8,
-                        'humidity_comfort': 8,
-                        'wind_comfort': 8,
-                        'overall_comfort': 8
-                    }
-                },
-                'afternoon': {
-                    'health_safety': {
-                        'uv_warning': 'High UV levels - maximum protection required',
-                        'air_quality': 'Monitor air quality during peak heat',
-                        'heat_stress': 'Moderate to high risk during peak hours',
-                        'safety_tips': ['Seek shade 12-4PM', 'Increase water intake', 'Limit strenuous activity'],
-                        'health_benefits': ['Peak daylight exposure', 'High energy levels', 'Social activity time']
-                    },
-                    'clothing': {
-                        'recommended': ['Lightweight clothing', 'Sun hat', 'UV-protective clothing', 'Sunglasses'],
-                        'avoid': ['Heavy fabrics', 'Dark colors', 'Tight clothing'],
-                        'accessories': ['Large water bottle', 'Cooling towel', 'Portable shade'],
-                        'footwear': ['Ventilated shoes', 'Moisture-wicking socks', 'Sandals for casual wear']
-                    },
-                    'activities': {
-                        'highly_recommended': ['Swimming', 'Beach activities', 'Shaded outdoor dining', 'Indoor sports'],
-                        'suitable': ['Shopping', 'Museum visits', 'Air-conditioned venues'],
-                        'avoid': ['Intense outdoor exercise', 'Prolonged sun exposure', 'Heavy physical work'],
-                        'energy_level': 'Peak - but avoid overheating'
-                    },
-                    'spotify_moods': ['summer hits', 'beach vibes', 'pop classics', 'feel good music'],
-                    'color_palette': ['#FF6B35', '#F7931E', '#FFD23F', '#06FFA5', '#FF4081'],
-                    'comfort_factors': {
-                        'temperature_comfort': 6,
-                        'humidity_comfort': 6,
-                        'wind_comfort': 7,
-                        'overall_comfort': 6
-                    }
-                },
-                'late_afternoon': {
-                    'health_safety': {
-                        'uv_warning': 'Moderate to high UV - still need protection',
-                        'air_quality': 'Improving as temperature drops',
-                        'heat_stress': 'Decreasing risk',
-                        'safety_tips': ['Continue sun protection', 'Stay hydrated', 'Good for activities'],
-                        'health_benefits': ['Golden hour benefits', 'Comfortable temperatures', 'Social time']
-                    },
-                    'clothing': {
-                        'recommended': ['Casual layers', 'Light fabrics', 'Comfortable attire'],
-                        'avoid': ['Heavy clothing', 'Restrictive items'],
-                        'accessories': ['Sunglasses', 'Light bag', 'Camera'],
-                        'footwear': ['Walking shoes', 'Comfortable sandals', 'Casual sneakers']
-                    },
-                    'activities': {
-                        'highly_recommended': ['Photography', 'Outdoor dining', 'Walking', 'Social sports'],
-                        'suitable': ['Shopping', 'Sightseeing', 'Casual exercise', 'Outdoor events'],
-                        'avoid': ['Intense workouts in heat'],
-                        'energy_level': 'Moderate - perfect for varied activities'
-                    },
-                    'spotify_moods': ['golden hour', 'indie sunset', 'chill pop', 'acoustic afternoon'],
-                    'color_palette': ['#FF9A56', '#FFB366', '#FFC947', '#FFD700', '#FFA500'],
-                    'comfort_factors': {
-                        'temperature_comfort': 8,
-                        'humidity_comfort': 8,
-                        'wind_comfort': 8,
-                        'overall_comfort': 8
-                    }
-                },
-                'evening': {
-                    'health_safety': {
-                        'uv_warning': 'Decreasing UV levels - minimal protection needed',
-                        'air_quality': 'Excellent for outdoor activities',
-                        'heat_stress': 'Low risk, comfortable conditions',
-                        'safety_tips': ['Perfect time for exercise', 'Stay visible if walking', 'Hydration still important'],
-                        'health_benefits': ['Stress relief', 'Social connection', 'Improved sleep preparation']
-                    },
-                    'clothing': {
-                        'recommended': ['Light layers', 'Comfortable casual wear', 'Light jacket if breezy'],
-                        'avoid': ['Heavy clothing', 'Overdressing'],
-                        'accessories': ['Light scarf', 'Comfortable shoes', 'Phone light for visibility'],
-                        'footwear': ['Comfortable walking shoes', 'Casual sneakers', 'Breathable options']
-                    },
-                    'activities': {
-                        'highly_recommended': ['Outdoor dining', 'Walking', 'Social gatherings', 'Sunset viewing'],
-                        'suitable': ['Light exercise', 'Photography', 'Outdoor events', 'Barbecue'],
-                        'avoid': ['Intense workouts', 'Heavy meals before activity'],
-                        'energy_level': 'Moderate to high - ideal for social activities'
-                    },
-                    'spotify_moods': ['sunset chill', 'acoustic evening', 'indie folk', 'mellow vibes'],
-                    'color_palette': ['#FF8C42', '#FF6B35', '#C73E1D', '#592E34', '#8E44AD'],
-                    'comfort_factors': {
-                        'temperature_comfort': 9,
-                        'humidity_comfort': 9,
-                        'wind_comfort': 9,
-                        'overall_comfort': 9
-                    }
-                },
-                'night': {
-                    'health_safety': {
-                        'uv_warning': 'No UV concern',
-                        'air_quality': 'Cool, fresh air ideal for relaxation',
-                        'heat_stress': 'No risk, comfortable conditions',
-                        'safety_tips': ['Use proper lighting', 'Dress for temperature drop', 'Stay visible'],
-                        'health_benefits': ['Better sleep preparation', 'Stress reduction', 'Peaceful environment']
-                    },
-                    'clothing': {
-                        'recommended': ['Light layers', 'Comfortable evening wear', 'Light jacket'],
-                        'avoid': ['Too many layers', 'Uncomfortable clothing'],
-                        'accessories': ['Light scarf', 'Comfortable shoes', 'Phone/flashlight'],
-                        'footwear': ['Comfortable shoes', 'Non-slip soles', 'Warm socks if cool']
-                    },
-                    'activities': {
-                        'highly_recommended': ['Stargazing', 'Peaceful walks', 'Outdoor socializing', 'Reading'],
-                        'suitable': ['Light stretching', 'Meditation', 'Quiet conversations'],
-                        'avoid': ['Intense exercise', 'Loud activities', 'Heavy meals'],
-                        'energy_level': 'Low to moderate - focus on relaxation'
-                    },
-                    'spotify_moods': ['night jazz', 'ambient sleep', 'lo-fi chill', 'peaceful instrumentals'],
-                    'color_palette': ['#2C3E50', '#34495E', '#5D6D7E', '#85929E', '#1ABC9C'],
-                    'comfort_factors': {
-                        'temperature_comfort': 8,
-                        'humidity_comfort': 8,
-                        'wind_comfort': 7,
-                        'overall_comfort': 8
-                    }
-                }
-            },
-            'Clouds': {
-                'morning': {
-                    'health_safety': {
-                        'uv_warning': 'Reduced UV levels due to cloud cover',
-                        'air_quality': 'Stable air conditions, good for sensitive individuals',
-                        'heat_stress': 'Very low risk, ideal exercise conditions',
-                        'safety_tips': ['Perfect conditions for exercise', 'Light protection still recommended'],
-                        'health_benefits': ['Comfortable temperature', 'Reduced glare', 'Stable conditions']
-                    },
-                    'clothing': {
-                        'recommended': ['Comfortable layers', 'Light athletic wear', 'Versatile clothing'],
-                        'avoid': ['Heavy sun protection', 'Overly light clothing'],
-                        'accessories': ['Light jacket option', 'Water bottle', 'Comfortable shoes'],
-                        'footwear': ['Athletic shoes', 'Comfortable sneakers', 'Breathable socks']
-                    },
-                    'activities': {
-                        'highly_recommended': ['Running', 'Cycling', 'Outdoor sports', 'Walking', 'Hiking'],
-                        'suitable': ['Any outdoor activity', 'Photography', 'Exercise', 'Gardening'],
-                        'avoid': ['Activities requiring specific lighting'],
-                        'energy_level': 'High - perfect conditions for activity'
-                    },
-                    'spotify_moods': ['indie morning', 'alternative rock', 'chill beats', 'acoustic pop'],
-                    'color_palette': ['#BDC3C7', '#95A5A6', '#7F8C8D', '#AEB6BF', '#5DADE2'],
-                    'comfort_factors': {
-                        'temperature_comfort': 9,
-                        'humidity_comfort': 8,
-                        'wind_comfort': 8,
-                        'overall_comfort': 9
-                    }
-                },
-                'afternoon': {
-                    'health_safety': {
-                        'uv_warning': 'Moderate UV levels, some protection recommended',
-                        'air_quality': 'Stable atmospheric conditions',
-                        'heat_stress': 'Low risk, comfortable for most activities',
-                        'safety_tips': ['Ideal conditions for most activities', 'Stay hydrated'],
-                        'health_benefits': ['Comfortable exercise conditions', 'Reduced heat stress']
-                    },
-                    'clothing': {
-                        'recommended': ['Casual layers', 'Comfortable clothing', 'Light options'],
-                        'avoid': ['Heavy clothing', 'Excessive sun protection'],
-                        'accessories': ['Light sweater option', 'Comfortable shoes', 'Water bottle'],
-                        'footwear': ['Casual shoes', 'Comfortable walking shoes', 'Breathable options']
-                    },
-                    'activities': {
-                        'highly_recommended': ['Outdoor exploration', 'Sports', 'Walking', 'Cycling'],
-                        'suitable': ['Shopping', 'Sightseeing', 'Outdoor dining', 'Photography'],
-                        'avoid': ['Sun-dependent activities'],
-                        'energy_level': 'High - excellent for various activities'
-                    },
-                    'spotify_moods': ['indie pop', 'alternative hits', 'chill rock', 'acoustic covers'],
-                    'color_palette': ['#D5DBDB', '#AEB6BF', '#85929E', '#566573', '#3498DB'],
-                    'comfort_factors': {
-                        'temperature_comfort': 8,
-                        'humidity_comfort': 8,
-                        'wind_comfort': 8,
-                        'overall_comfort': 8
-                    }
-                },
-                'evening': {
-                    'health_safety': {
-                        'uv_warning': 'Minimal UV concern',
-                        'air_quality': 'Stable, comfortable conditions',
-                        'heat_stress': 'No risk, perfect comfort zone',
-                        'safety_tips': ['Excellent conditions for evening activities'],
-                        'health_benefits': ['Stress reduction', 'Comfortable socializing', 'Pleasant atmosphere']
-                    },
-                    'clothing': {
-                        'recommended': ['Comfortable evening wear', 'Light layers', 'Casual options'],
-                        'avoid': ['Heavy clothing', 'Overdressing'],
-                        'accessories': ['Light jacket', 'Comfortable shoes', 'Evening accessories'],
-                        'footwear': ['Comfortable evening shoes', 'Casual sneakers', 'Walking shoes']
-                    },
-                    'activities': {
-                        'highly_recommended': ['Social gatherings', 'Outdoor dining', 'Walking', 'Events'],
-                        'suitable': ['Exercise', 'Shopping', 'Entertainment', 'Relaxation'],
-                        'avoid': ['Activities requiring specific weather'],
-                        'energy_level': 'Moderate to high - great for social activities'
-                    },
-                    'spotify_moods': ['evening chill', 'indie acoustic', 'mellow rock', 'coffee shop vibes'],
-                    'color_palette': ['#909497', '#717D7E', '#515A5A', '#2C3E50', '#8E44AD'],
-                    'comfort_factors': {
-                        'temperature_comfort': 9,
-                        'humidity_comfort': 8,
-                        'wind_comfort': 8,
-                        'overall_comfort': 9
-                    }
-                },
-                'night': {
-                    'health_safety': {
-                        'uv_warning': 'No UV concern',
-                        'air_quality': 'Stable, mild conditions',
-                        'heat_stress': 'No risk, comfortable for rest',
-                        'safety_tips': ['Comfortable conditions for evening activities'],
-                        'health_benefits': ['Good sleeping conditions', 'Comfortable humidity', 'Peaceful environment']
-                    },
-                    'clothing': {
-                        'recommended': ['Comfortable layers', 'Cozy evening wear', 'Light jacket'],
-                        'avoid': ['Too light clothing', 'Uncomfortable fabrics'],
-                        'accessories': ['Comfortable layers', 'Cozy accessories', 'Good shoes'],
-                        'footwear': ['Comfortable shoes', 'Warm options if cool', 'Non-slip soles']
-                    },
-                    'activities': {
-                        'highly_recommended': ['Indoor activities', 'Cozy socializing', 'Reading', 'Relaxation'],
-                        'suitable': ['Light walks', 'Indoor entertainment', 'Quiet activities'],
-                        'avoid': ['Outdoor activities requiring clear skies'],
-                        'energy_level': 'Low to moderate - focus on comfort'
-                    },
-                    'spotify_moods': ['night ambient', 'lo-fi hip hop', 'jazz instrumentals', 'sleep sounds'],
-                    'color_palette': ['#5D6D7E', '#566573', '#515A5A', '#424949', '#1ABC9C'],
-                    'comfort_factors': {
-                        'temperature_comfort': 8,
-                        'humidity_comfort': 8,
-                        'wind_comfort': 7,
-                        'overall_comfort': 8
-                    }
-                }
-            },
-            'Rain': {
-                'morning': {
-                    'health_safety': {
-                        'uv_warning': 'Very low UV due to cloud cover',
-                        'air_quality': 'Rain cleanses air, excellent quality',
-                        'heat_stress': 'No risk, cool and comfortable',
-                        'safety_tips': ['Stay dry', 'Watch for slippery surfaces', 'Use proper rain gear'],
-                        'health_benefits': ['Clean air', 'Natural humidification', 'Peaceful atmosphere']
-                    },
-                    'clothing': {
-                        'recommended': ['Waterproof jacket', 'Rain boots', 'Quick-dry clothing', 'Umbrella'],
-                        'avoid': ['Cotton clothing', 'Suede/leather', 'Open shoes'],
-                        'accessories': ['Umbrella', 'Waterproof bag', 'Rain hat', 'Waterproof phone case'],
-                        'footwear': ['Waterproof boots', 'Non-slip soles', 'Quick-dry socks']
-                    },
-                    'activities': {
-                        'highly_recommended': ['Indoor exercise', 'Cozy café visits', 'Reading', 'Indoor hobbies'],
-                        'suitable': ['Museum visits', 'Shopping', 'Indoor sports', 'Cooking'],
-                        'avoid': ['Outdoor sports', 'Electronics outdoors', 'Long outdoor exposure'],
-                        'energy_level': 'Moderate - focus on indoor activities'
-                    },
-                    'spotify_moods': ['rainy day jazz', 'cozy coffee shop', 'indie folk', 'mellow acoustic'],
-                    'color_palette': ['#5DADE2', '#3498DB', '#2980B9', '#1B4F72', '#85C1E9'],
-                    'comfort_factors': {
-                        'temperature_comfort': 7,
-                        'humidity_comfort': 6,
-                        'wind_comfort': 5,
-                        'overall_comfort': 6
-                    }
-                },
-                'afternoon': {
-                    'health_safety': {
-                        'uv_warning': 'Minimal UV exposure',
-                        'air_quality': 'Excellent due to rain washing pollutants',
-                        'heat_stress': 'No risk, comfortable temperature',
-                        'safety_tips': ['Avoid outdoor electrical hazards', 'Drive carefully', 'Stay warm'],
-                        'health_benefits': ['Fresh air post-rain', 'Comfortable humidity', 'Stress relief from rain sounds']
-                    },
-                    'clothing': {
-                        'recommended': ['Layered rain gear', 'Waterproof clothing', 'Warm layers', 'Rain accessories'],
-                        'avoid': ['Light clothing', 'Non-waterproof items', 'White/light colors'],
-                        'accessories': ['Quality umbrella', 'Waterproof bag', 'Warm scarf', 'Rain cover'],
-                        'footwear': ['Waterproof shoes', 'Good tread', 'Warm socks', 'Quick-dry materials']
-                    },
-                    'activities': {
-                        'highly_recommended': ['Indoor shopping', 'Movie theaters', 'Museums', 'Cozy restaurants'],
-                        'suitable': ['Indoor sports', 'Libraries', 'Art galleries', 'Indoor entertainment'],
-                        'avoid': ['Outdoor events', 'Beach activities', 'Picnics'],
-                        'energy_level': 'Moderate - indoor focus recommended'
-                    },
-                    'spotify_moods': ['rainy afternoon', 'indie chill', 'acoustic covers', 'mellow hits'],
-                    'color_palette': ['#7FB3D3', '#5DADE2', '#3498DB', '#2980B9', '#AED6F1'],
-                    'comfort_factors': {
-                        'temperature_comfort': 7,
-                        'humidity_comfort': 6,
-                        'wind_comfort': 5,
-                        'overall_comfort': 6
-                    }
-                },
-                'evening': {
-                    'health_safety': {
-                        'uv_warning': 'No UV concern',
-                        'air_quality': 'Fresh and clean post-rain',
-                        'heat_stress': 'No risk, pleasant cool conditions',
-                        'safety_tips': ['Be cautious of wet surfaces', 'Use good lighting', 'Stay warm'],
-                        'health_benefits': ['Clean air breathing', 'Relaxing atmosphere', 'Natural cooling']
-                    },
-                    'clothing': {
-                        'recommended': ['Cozy indoor wear', 'Warm layers', 'Comfortable clothing', 'Slippers'],
-                        'avoid': ['Going out without rain gear', 'Light fabrics'],
-                        'accessories': ['Warm blanket', 'Hot beverage', 'Cozy socks', 'Comfortable layers'],
-                        'footwear': ['Indoor shoes', 'Warm socks', 'Comfortable slippers', 'Dry shoes']
-                    },
-                    'activities': {
-                        'highly_recommended': ['Home cooking', 'Reading', 'Movie watching', 'Board games'],
-                        'suitable': ['Indoor hobbies', 'Online activities', 'Video calls', 'Relaxation'],
-                        'avoid': ['Outdoor dining', 'Outdoor events', 'Travel if possible'],
-                        'energy_level': 'Low to moderate - perfect for relaxation'
-                    },
-                    'spotify_moods': ['rainy evening', 'cozy jazz', 'ambient relaxation', 'peaceful instrumentals'],
-                    'color_palette': ['#AED6F1', '#85C1E9', '#5DADE2', '#3498DB', '#2E86AB'],
-                    'comfort_factors': {
-                        'temperature_comfort': 8,
-                        'humidity_comfort': 7,
-                        'wind_comfort': 6,
-                        'overall_comfort': 7
-                    }
-                },
-                'night': {
-                    'health_safety': {
-                        'uv_warning': 'No UV concern',
-                        'air_quality': 'Excellent, fresh rain-washed air',
-                        'heat_stress': 'No risk, cool and comfortable',
-                        'safety_tips': ['Stay indoors for comfort', 'Keep warm', 'Enjoy the peaceful sounds'],
-                        'health_benefits': ['Perfect sleeping weather', 'Natural white noise', 'Fresh air']
-                    },
-                    'clothing': {
-                        'recommended': ['Cozy pajamas', 'Warm layers', 'Comfortable sleepwear', 'Warm socks'],
-                        'avoid': ['Light sleepwear if cold', 'Going outside unnecessarily'],
-                        'accessories': ['Extra blankets', 'Warm drinks', 'Cozy slippers', 'Comfortable pillows'],
-                        'footwear': ['Warm slippers', 'Cozy socks', 'Indoor shoes', 'Comfort priority']
-                    },
-                    'activities': {
-                        'highly_recommended': ['Sleeping', 'Reading in bed', 'Meditation', 'Quiet relaxation'],
-                        'suitable': ['Gentle stretching', 'Journaling', 'Quiet music', 'Rest'],
-                        'avoid': ['Stimulating activities', 'Going outside', 'Loud activities'],
-                        'energy_level': 'Very low - perfect for sleep'
-                    },
-                    'spotify_moods': ['rain sleep sounds', 'ambient night', 'peaceful meditation', 'sleep music'],
-                    'color_palette': ['#D6EAF8', '#AED6F1', '#85C1E9', '#5DADE2', '#2E8B57'],
-                    'comfort_factors': {
-                        'temperature_comfort': 9,
-                        'humidity_comfort': 8,
-                        'wind_comfort': 7,
-                        'overall_comfort': 8
-                    }
-                }
-            }
+        key_string = ":".join(key_parts)
+        return hashlib.md5(key_string.encode()).hexdigest()
+    
+    def _should_fetch_new_data(self, lat: float, lon: float, data_type: str) -> bool:
+        cache_key = self._generate_cache_key(f"{data_type}_meta", lat, lon)
+        
+        cached_meta = self._get_from_cache(cache_key, use_memory=True)
+        if not cached_meta:
+            return True
+        
+        time_diff = time.time() - cached_meta.get('timestamp', 0)
+        if time_diff > self.temporal_threshold:
+            return True
+        
+        cached_lat = cached_meta.get('lat', 0)
+        cached_lon = cached_meta.get('lon', 0)
+        
+        lat_diff = abs(lat - cached_lat)
+        lon_diff = abs(lon - cached_lon)
+        
+        if lat_diff > self.spatial_threshold or lon_diff > self.spatial_threshold:
+            return True
+        
+        return False
+    
+    def _get_from_cache(self, key: str, use_memory: bool = False) -> Optional[Dict]:
+        try:
+            if self.redis_client and not use_memory:
+                data = self.redis_client.get(key)
+                if data:
+                    return json.loads(data)
+        except Exception as e:
+            logger.warning(f"Redis get error: {e}")
+        
+        cached_item = self.memory_cache.get(key)
+        if cached_item:
+            if cached_item.get('expires', 0) > time.time():
+                return cached_item.get('data')
+            else:
+                del self.memory_cache[key]
+        return None
+    
+    def _set_cache(self, key: str, data: Dict, ttl: int, use_memory: bool = False):
+        try:
+            if self.redis_client and not use_memory:
+                self.redis_client.setex(key, ttl, json.dumps(data, default=str))
+                return
+        except Exception as e:
+            logger.warning(f"Redis set error: {e}")
+        
+        self.memory_cache[key] = {
+            'data': data,
+            'expires': time.time() + ttl
         }
     
     async def get_ultra_weather_analysis(self, lat: float, lon: float) -> Dict:
-        weather_data = None
-        air_quality = None
-        health_insights = None
+        request_id = str(uuid.uuid4())
+        logger.info(f"[{request_id}] Starting ultra weather analysis for {lat:.4f}, {lon:.4f}")
         
-        if self.accuweather_api_key:
-            try:
-                logger.info("Querying AccuWeather (primary provider)")
-                weather_data = await self._get_accuweather_current(lat, lon)
-                air_quality = await self._get_accuweather_air_quality(lat, lon)
-                health_insights = await self._calculate_comprehensive_health_insights(weather_data, air_quality)
-            except Exception as e:
-                logger.warning(f"AccuWeather failed: {e}")
+        if not self._should_fetch_new_data(lat, lon, 'ultra_weather'):
+            cache_key = self._generate_cache_key('ultra_weather', lat, lon)
+            cached_data = self._get_from_cache(cache_key)
+            if cached_data:
+                logger.info(f"[{request_id}] Returning cached weather data")
+                cached_data['cache_hit'] = True
+                cached_data['request_id'] = request_id
+                return cached_data
         
-        if not weather_data:
-            for provider in ['tomorrow', 'visual_crossing', 'openweather']:
-                try:
-                    if provider == 'tomorrow' and self.tomorrow_api_key:
-                        weather_data = await self._get_tomorrow_current(lat, lon)
-                        if not air_quality:
-                            air_quality = await self._get_tomorrow_air_quality(lat, lon)
-                    elif provider == 'visual_crossing' and self.visual_crossing_api_key:
-                        weather_data = await self._get_visual_crossing_current(lat, lon)
-                    elif provider == 'openweather' and self.openweather_api_key:
-                        weather_data = await self._get_openweather_current(lat, lon)
-                        if not air_quality:
-                            air_quality = await self._get_openweather_air_quality(lat, lon)
-                    
-                    if weather_data:
-                        logger.info(f"Using {provider} as weather provider")
-                        break
-                except Exception as e:
-                    logger.warning(f"{provider} failed: {e}")
+        location_key = f"{round(lat, 3)},{round(lon, 3)}"
         
-        if not weather_data:
-            raise Exception("All weather providers failed")
+        async def fetch_weather_data():
+            return await self._fetch_comprehensive_weather_data(lat, lon, request_id)
         
-        if not health_insights:
-            health_insights = await self._calculate_comprehensive_health_insights(weather_data, air_quality)
-        
-        current_hour = datetime.now().hour
-        time_period = self._get_precise_time_period(current_hour)
-        
-        recommendations = self._get_ultra_recommendations(
-            weather_data.condition, time_period, weather_data.temperature, weather_data
-        )
-        
-        activity_scores = self._calculate_activity_suitability(weather_data, time_period)
-        
-        personalized_suggestions = self._generate_personalized_suggestions(
-            weather_data, time_period, health_insights
-        )
-        
-        return {
-            'success': True,
-            'weather': {
-                'temperature': {
-                    'current': round(weather_data.temperature, 1),
-                    'feels_like': round(weather_data.feels_like, 1),
-                    'dew_point': round(weather_data.dew_point, 1),
-                    'unit': '°C'
+        try:
+            weather_data = await self.request_deduplicator.deduplicate_request(
+                f"weather:{location_key}", fetch_weather_data
+            )
+            
+            current_hour = datetime.now().hour
+            time_period = self._get_precise_time_period(current_hour)
+            
+            activities = self.activity_recommender.get_time_appropriate_activities(
+                current_hour,
+                weather_data['weather']['condition'],
+                weather_data['weather']['temperature']['current'],
+                weather_data['weather']['wind']['speed']
+            )
+            
+            enhanced_response = {
+                'success': True,
+                'request_id': request_id,
+                'weather': weather_data['weather'],
+                'air_quality': weather_data.get('air_quality'),
+                'health_insights': weather_data.get('health_insights'),
+                'current_hour': current_hour,
+                'time_period': time_period,
+                'smart_recommendations': {
+                    'activities': activities,
+                    'time_context': self._get_time_context(current_hour),
+                    'weather_suitability': self._assess_weather_suitability(weather_data['weather']),
+                    'comfort_score': self._calculate_comfort_score(weather_data['weather'])
                 },
-                'condition': weather_data.condition,
-                'description': weather_data.description,
-                'icon': weather_data.icon,
-                'humidity': weather_data.humidity,
-                'pressure': weather_data.pressure,
-                'wind': {
-                    'speed': weather_data.wind_speed,
-                    'direction': weather_data.wind_direction,
-                    'description': self._get_wind_description(weather_data.wind_speed)
-                },
-                'visibility': weather_data.visibility,
-                'uv_index': weather_data.uv_index,
-                'cloud_cover': weather_data.cloud_cover,
-                'precipitation': {
-                    'current': weather_data.precipitation,
-                    'probability': weather_data.precipitation_probability
-                }
-            },
-            'air_quality': air_quality.__dict__ if air_quality else None,
-            'health_insights': health_insights.__dict__ if health_insights else None,
-            'time_period': time_period,
-            'comprehensive_insights': {
-                'health_safety': recommendations['health_safety'],
-                'clothing_recommendations': recommendations['clothing'],
-                'activity_suggestions': recommendations['activities'],
-                'spotify_moods': recommendations['spotify_moods'],
-                'color_palette': recommendations['color_palette'],
-                'comfort_factors': recommendations['comfort_factors']
-            },
-            'activity_suitability': activity_scores,
-            'personalized_suggestions': personalized_suggestions,
-            'location': {'lat': lat, 'lon': lon},
-            'timestamp': datetime.utcnow().isoformat(),
-            'accuracy_score': 0.98 if self.accuweather_api_key and weather_data.condition else 0.85
-        }
+                'location': {'lat': lat, 'lon': lon},
+                'cache_hit': False,
+                'timestamp': datetime.utcnow().isoformat(),
+                'accuracy_score': weather_data.get('accuracy_score', 0.85)
+            }
+            
+            cache_key = self._generate_cache_key('ultra_weather', lat, lon)
+            self._set_cache(cache_key, enhanced_response, self.cache_ttls['current_weather'])
+            
+            meta_key = self._generate_cache_key('ultra_weather_meta', lat, lon)
+            meta_data = {'timestamp': time.time(), 'lat': lat, 'lon': lon}
+            self._set_cache(meta_key, meta_data, self.cache_ttls['current_weather'], use_memory=True)
+            
+            logger.info(f"[{request_id}] Ultra weather analysis completed successfully")
+            return enhanced_response
+            
+        except Exception as e:
+            logger.error(f"[{request_id}] Ultra weather analysis failed: {e}")
+            current_hour = datetime.now().hour
+            return {
+                'success': False,
+                'error': 'Weather service temporarily unavailable',
+                'request_id': request_id,
+                'fallback_recommendations': self._get_fallback_recommendations(current_hour),
+                'timestamp': datetime.utcnow().isoformat()
+            }
     
     async def get_current_weather_enhanced(self, lat: float, lon: float) -> Dict:
         weather_data = None
@@ -878,6 +648,58 @@ class UltraWeatherService:
             'timestamp': datetime.utcnow().isoformat()
         }
     
+    async def _fetch_comprehensive_weather_data(self, lat: float, lon: float, request_id: str) -> Dict:
+        providers = ['accuweather', 'tomorrow', 'visual_crossing', 'openweather']
+        
+        for provider in providers:
+            if not self.circuit_breaker.can_execute(provider):
+                logger.warning(f"[{request_id}] Circuit breaker open for {provider}")
+                continue
+            
+            if not self.rate_limiter.can_make_request(provider):
+                logger.warning(f"[{request_id}] Rate limit exceeded for {provider}")
+                continue
+            
+            try:
+                logger.info(f"[{request_id}] Attempting to fetch from {provider}")
+                
+                if provider == 'accuweather' and self.accuweather_api_key:
+                    weather_data = await self._get_accuweather_current(lat, lon)
+                    air_quality = await self._get_accuweather_air_quality(lat, lon)
+                elif provider == 'tomorrow' and self.tomorrow_api_key:
+                    weather_data = await self._get_tomorrow_current(lat, lon)
+                    air_quality = await self._get_tomorrow_air_quality(lat, lon)
+                elif provider == 'visual_crossing' and self.visual_crossing_api_key:
+                    weather_data = await self._get_visual_crossing_current(lat, lon)
+                    air_quality = None
+                elif provider == 'openweather' and self.openweather_api_key:
+                    weather_data = await self._get_openweather_current(lat, lon)
+                    air_quality = await self._get_openweather_air_quality(lat, lon)
+                else:
+                    continue
+                
+                self.rate_limiter.record_call(provider)
+                self.circuit_breaker.record_success(provider)
+                
+                health_insights = await self._calculate_comprehensive_health_insights(weather_data, air_quality)
+                
+                logger.info(f"[{request_id}] Successfully fetched from {provider}")
+                
+                return {
+                    'weather': self._format_weather_response(weather_data),
+                    'air_quality': air_quality.__dict__ if air_quality else None,
+                    'health_insights': health_insights.__dict__ if health_insights else None,
+                    'provider': provider,
+                    'accuracy_score': 0.98 if provider == 'accuweather' else 0.90 if provider == 'tomorrow' else 0.85
+                }
+                
+            except Exception as e:
+                logger.warning(f"[{request_id}] {provider} failed: {e}")
+                self.circuit_breaker.record_failure(provider)
+                continue
+        
+        raise Exception("All weather providers failed")
+    
     async def _get_accuweather_current(self, lat: float, lon: float) -> WeatherData:
         location_key = await self._get_accuweather_location_key(lat, lon)
         
@@ -939,57 +761,14 @@ class UltraWeatherService:
                 
                 return data['Key']
     
-    async def _get_accuweather_air_quality(self, lat: float, lon: float) -> AirQualityData:
-
-        location_key = await self._get_accuweather_location_key(lat, lon)
-
-        url = f"http://dataservice.accuweather.com/airquality/v2/current/{location_key}"
-        params = {'apikey': self.accuweather_api_key}
-        
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, params=params, timeout=10) as response:
-                if response.status != 200:
-                    raise Exception(f"AccuWeather air quality API error: {response.status}")
-                
-                data = await response.json()
-                
-                if not data or not isinstance(data, list) or len(data) == 0:
-                    raise Exception("Invalid AccuWeather air quality response")
-                
-                aqi = data[0]['AirQualityIndex']
-                level_map = {
-                    (0, 50): 'Good',
-                    (51, 100): 'Moderate',
-                    (101, 150): 'Unhealthy for Sensitive Groups',
-                    (151, 200): 'Unhealthy',
-                    (201, 300): 'Very Unhealthy',
-                    (301, 500): 'Hazardous'
-                }
-                
-                level = 'Unknown'
-                for (min_val, max_val), level_name in level_map.items():
-                    if min_val <= aqi <= max_val:
-                        level = level_name
-                        break
-                
-                return AirQualityData(
-                    aqi=aqi,
-                    level=level,
-                    pm2_5=data[0].get('PM25', 0),
-                    pm10=data[0].get('PM10', 0),
-                    o3=data[0].get('Ozone', 0),
-                    no2=data[0].get('NO2', 0),
-                    co=data[0].get('CO', 0),
-                    so2=data[0].get('SO2', 0),
-                    health_recommendation=self._get_enhanced_air_quality_advice(aqi)
-                )
+    async def _get_accuweather_air_quality(self, lat: float, lon: float) -> Optional[AirQualityData]:
         try:
             logger.info("AccuWeather air quality not available in free tier")
             return None
         except Exception as e:
             logger.warning(f"AccuWeather air quality error: {e}")
             return None
-
+    
     async def _get_accuweather_forecast(self, lat: float, lon: float, days: int) -> List[Dict]:
         location_key = await self._get_accuweather_location_key(lat, lon)
         
@@ -1077,7 +856,7 @@ class UltraWeatherService:
                     dew_point=values.get('dewPoint', 0)
                 )
     
-    async def _get_tomorrow_air_quality(self, lat: float, lon: float) -> AirQualityData:
+    async def _get_tomorrow_air_quality(self, lat: float, lon: float) -> Optional[AirQualityData]:
         url = "https://api.tomorrow.io/v4/weather/realtime"
         params = {
             'location': f"{lat},{lon}",
@@ -1340,7 +1119,7 @@ class UltraWeatherService:
                     timestamp=datetime.fromtimestamp(data.get('dt', 0))
                 )
     
-    async def _get_openweather_air_quality(self, lat: float, lon: float) -> AirQualityData:
+    async def _get_openweather_air_quality(self, lat: float, lon: float) -> Optional[AirQualityData]:
         url = "http://api.openweathermap.org/data/2.5/air_pollution"
         params = {
             'lat': lat,
@@ -1438,153 +1217,225 @@ class UltraWeatherService:
                 
                 return forecast
     
-    async def _calculate_comprehensive_health_insights(self, weather: WeatherData, air_quality: Optional[AirQualityData]) -> HealthInsights:
-        temp = weather.temperature
-        humidity = weather.humidity
-        wind_speed = weather.wind_speed
-        uv_index = weather.uv_index
-        
-        heat_index = self._calculate_heat_index(temp, humidity)
-        wind_chill = self._calculate_wind_chill(temp, wind_speed)
-        
-        comfort_level = self._determine_comfort_level(temp, humidity, wind_speed)
-        hydration_advice = self._get_hydration_advice(temp, humidity)
-        exercise_advice = self._get_exercise_advice(temp, humidity, air_quality)
-        
-        health_tips = self._generate_comprehensive_health_tips(temp, humidity, uv_index, air_quality)
-        
-        return HealthInsights(
-            heat_index=heat_index,
-            wind_chill=wind_chill,
-            pollen_level='Unknown',
-            air_quality_advice=self._get_air_quality_advice(air_quality.aqi if air_quality else 1),
-            uv_advice=self._get_uv_advice(uv_index),
-            general_health_tips=health_tips,
-            comfort_level=comfort_level,
-            hydration_advice=hydration_advice,
-            exercise_advice=exercise_advice
-        )
-    
-    def _calculate_activity_suitability(self, weather: WeatherData, time_period: str) -> Dict:
-        activities = {
-            'outdoor_exercise': 0,
-            'walking': 0,
-            'cycling': 0,
-            'water_activities': 0,
-            'indoor_activities': 0,
-            'social_outdoor': 0,
-            'photography': 0,
-            'relaxation': 0
+    def _get_time_context(self, hour: int) -> Dict:
+        contexts = {
+            (5, 8): {
+                'period': 'Early Morning',
+                'description': 'Fresh start to the day',
+                'energy_level': 'Building',
+                'lighting': 'Sunrise/Dawn',
+                'typical_activities': ['exercise', 'commuting', 'breakfast']
+            },
+            (8, 12): {
+                'period': 'Morning',
+                'description': 'Peak morning energy',
+                'energy_level': 'High',
+                'lighting': 'Bright daylight',
+                'typical_activities': ['work', 'outdoor_activities', 'errands']
+            },
+            (12, 17): {
+                'period': 'Afternoon',
+                'description': 'Midday peak activity',
+                'energy_level': 'Peak',
+                'lighting': 'Full sunlight',
+                'typical_activities': ['work', 'lunch', 'outdoor_activities']
+            },
+            (17, 20): {
+                'period': 'Early Evening',
+                'description': 'Wind down and social time',
+                'energy_level': 'Moderate',
+                'lighting': 'Golden hour',
+                'typical_activities': ['dinner', 'socializing', 'light_exercise']
+            },
+            (20, 23): {
+                'period': 'Evening',
+                'description': 'Relaxation and leisure',
+                'energy_level': 'Low to Moderate',
+                'lighting': 'Artificial lighting',
+                'typical_activities': ['dinner', 'entertainment', 'socializing']
+            },
+            (23, 5): {
+                'period': 'Night',
+                'description': 'Rest and sleep time',
+                'energy_level': 'Very Low',
+                'lighting': 'Dark/Minimal',
+                'typical_activities': ['sleep', 'rest', 'quiet_activities']
+            }
         }
         
-        temp = weather.temperature
-        wind = weather.wind_speed
-        humidity = weather.humidity
-        condition = weather.condition.lower()
+        for (start, end), context in contexts.items():
+            if start <= hour < end or (start > end and (hour >= start or hour < end)):
+                return context
         
-        if 15 <= temp <= 25 and wind < 15 and 'clear' in condition:
-            activities['outdoor_exercise'] = 95
-        elif 10 <= temp <= 30 and wind < 20:
-            activities['outdoor_exercise'] = 75
-        else:
-            activities['outdoor_exercise'] = 40
-        
-        if temp > 0 and wind < 25 and 'thunderstorm' not in condition:
-            activities['walking'] = 85
-        else:
-            activities['walking'] = 30
-        
-        if 10 <= temp <= 28 and wind < 20 and 'rain' not in condition:
-            activities['cycling'] = 80
-        else:
-            activities['cycling'] = 35
-        
-        if temp > 22 and 'clear' in condition or 'cloud' in condition:
-            activities['water_activities'] = 90
-        else:
-            activities['water_activities'] = 20
-        
-        activities['indoor_activities'] = 85
-        
-        if 15 <= temp <= 28 and 'rain' not in condition:
-            activities['social_outdoor'] = 85
-        else:
-            activities['social_outdoor'] = 45
-        
-        if time_period in ['early_morning', 'late_afternoon', 'evening']:
-            activities['photography'] = 90
-        else:
-            activities['photography'] = 70
-        
-        if 18 <= temp <= 26:
-            activities['relaxation'] = 95
-        else:
-            activities['relaxation'] = 75
-        
-        return activities
+        return contexts[(8, 12)]
     
-    def _generate_personalized_suggestions(self, weather: WeatherData, time_period: str, health: HealthInsights) -> Dict:
-        suggestions = {
-            'immediate_actions': [],
-            'clothing_specifics': [],
-            'activity_recommendations': [],
-            'health_priorities': [],
-            'comfort_tips': []
+    def _assess_weather_suitability(self, weather: Dict) -> Dict:
+        temp = weather['temperature']['current']
+        condition = weather['condition']
+        wind_speed = weather['wind']['speed']
+        humidity = weather['humidity']
+        
+        suitability = {
+            'outdoor_exercise': 'poor',
+            'social_activities': 'good',
+            'indoor_activities': 'excellent',
+            'water_activities': 'poor',
+            'travel': 'good'
         }
         
-        temp = weather.temperature
-        condition = weather.condition.lower()
-        wind = weather.wind_speed
-        humidity = weather.humidity
+        if 15 <= temp <= 25:
+            suitability['outdoor_exercise'] = 'excellent'
+            suitability['social_activities'] = 'excellent'
+        elif 10 <= temp <= 30:
+            suitability['outdoor_exercise'] = 'good'
+            suitability['social_activities'] = 'good'
+        elif temp < 5 or temp > 35:
+            suitability['outdoor_exercise'] = 'poor'
+            suitability['social_activities'] = 'fair'
         
-        if temp > 30:
-            suggestions['immediate_actions'].extend([
-                'Seek air conditioning or shade',
-                'Increase water intake immediately',
-                'Avoid strenuous outdoor activities'
-            ])
-            suggestions['clothing_specifics'].extend([
-                'Wear light-colored, loose-fitting clothing',
-                'Use a wide-brimmed hat',
-                'Apply sunscreen SPF 50+'
-            ])
-        elif temp < 5:
-            suggestions['immediate_actions'].extend([
-                'Layer clothing properly',
-                'Protect extremities from cold',
-                'Warm up gradually when going outside'
-            ])
-            suggestions['clothing_specifics'].extend([
-                'Wear thermal underwear',
-                'Use waterproof outer layer',
-                'Don\'t forget gloves and warm hat'
-            ])
+        if condition in ['Rain', 'Thunderstorm']:
+            suitability['outdoor_exercise'] = 'poor'
+            suitability['social_activities'] = 'fair'
+            suitability['travel'] = 'fair'
+        elif condition == 'Clear':
+            if suitability['outdoor_exercise'] != 'poor':
+                suitability['outdoor_exercise'] = 'excellent'
         
-        if time_period == 'morning':
-            suggestions['activity_recommendations'].extend([
-                'Perfect time for outdoor exercise',
-                'Great for vitamin D synthesis',
-                'Ideal for photography with soft lighting'
-            ])
-        elif time_period == 'afternoon':
-            suggestions['activity_recommendations'].extend([
-                'Seek indoor or shaded activities',
-                'Perfect for swimming or water sports',
-                'Good time for shopping or museums'
-            ])
+        if temp > 22 and condition in ['Clear', 'Clouds']:
+            suitability['water_activities'] = 'excellent'
+        elif temp > 18 and condition != 'Rain':
+            suitability['water_activities'] = 'good'
         
-        if 'rain' in condition:
-            suggestions['immediate_actions'].append('Have rain gear ready')
-            suggestions['comfort_tips'].append('Enjoy the calming sound of rain')
+        return suitability
+    
+    def _calculate_comfort_score(self, weather: Dict) -> Dict:
+        temp = weather['temperature']['current']
+        feels_like = weather['temperature']['feels_like']
+        humidity = weather['humidity']
+        wind_speed = weather['wind']['speed']
+        condition = weather['condition']
         
-        if wind > 20:
-            suggestions['immediate_actions'].append('Secure loose items outdoors')
-            suggestions['clothing_specifics'].append('Wear windproof outer layer')
+        temp_comfort = 100
+        if temp < 10 or temp > 30:
+            temp_comfort = max(0, 100 - abs(20 - temp) * 5)
+        elif 15 <= temp <= 25:
+            temp_comfort = 100
+        else:
+            temp_comfort = max(70, 100 - abs(20 - temp) * 3)
         
-        suggestions['health_priorities'].append(health.hydration_advice)
-        suggestions['health_priorities'].append(health.exercise_advice)
+        humidity_comfort = 100
+        if 40 <= humidity <= 60:
+            humidity_comfort = 100
+        elif 30 <= humidity <= 70:
+            humidity_comfort = 80
+        else:
+            humidity_comfort = max(30, 100 - abs(50 - humidity) * 2)
         
-        return suggestions
+        wind_comfort = 100
+        if wind_speed > 30:
+            wind_comfort = 20
+        elif wind_speed > 20:
+            wind_comfort = 50
+        elif wind_speed > 15:
+            wind_comfort = 70
+        
+        condition_modifier = {
+            'Clear': 1.0,
+            'Clouds': 0.9,
+            'Drizzle': 0.7,
+            'Rain': 0.5,
+            'Snow': 0.6,
+            'Thunderstorm': 0.3,
+            'Mist': 0.7
+        }.get(condition, 0.8)
+        
+        base_comfort = (temp_comfort + humidity_comfort + wind_comfort) / 3
+        overall_comfort = base_comfort * condition_modifier
+        
+        return {
+            'overall': round(overall_comfort, 1),
+            'temperature': round(temp_comfort, 1),
+            'humidity': round(humidity_comfort, 1),
+            'wind': round(wind_comfort, 1),
+            'weather_impact': round(condition_modifier * 100, 1),
+            'level': 'Excellent' if overall_comfort >= 80 else 'Good' if overall_comfort >= 60 else 'Fair' if overall_comfort >= 40 else 'Poor'
+        }
+    
+    def _get_fallback_recommendations(self, hour: int) -> Dict:
+        time_context = self._get_time_context(hour)
+        
+        if 22 <= hour or hour <= 5:
+            return {
+                'activities': {
+                    'highly_recommended': ['reading', 'relaxation', 'sleep', 'meditation'],
+                    'suitable': ['indoor_activities', 'quiet_music', 'light_stretching'],
+                    'avoid': ['outdoor_activities', 'intense_exercise', 'loud_activities']
+                },
+                'time_context': time_context,
+                'message': 'Weather data unavailable - showing time-appropriate recommendations'
+            }
+        elif 6 <= hour <= 10:
+            return {
+                'activities': {
+                    'highly_recommended': ['indoor_exercise', 'reading', 'breakfast', 'light_activities'],
+                    'suitable': ['walking', 'stretching', 'planning_day'],
+                    'avoid': ['intense_outdoor_sports']
+                },
+                'time_context': time_context,
+                'message': 'Weather data unavailable - showing time-appropriate recommendations'
+            }
+        else:
+            return {
+                'activities': {
+                    'highly_recommended': ['indoor_activities', 'shopping', 'socializing'],
+                    'suitable': ['light_exercise', 'errands', 'entertainment'],
+                    'avoid': ['weather_dependent_activities']
+                },
+                'time_context': time_context,
+                'message': 'Weather data unavailable - showing time-appropriate recommendations'
+            }
+    
+    def _format_weather_response(self, weather_data: WeatherData) -> Dict:
+        return {
+            'temperature': {
+                'current': round(weather_data.temperature, 1),
+                'feels_like': round(weather_data.feels_like, 1),
+                'unit': '°C'
+            },
+            'condition': weather_data.condition,
+            'description': weather_data.description,
+            'icon': weather_data.icon,
+            'humidity': weather_data.humidity,
+            'pressure': weather_data.pressure,
+            'wind': {
+                'speed': weather_data.wind_speed,
+                'direction': weather_data.wind_direction,
+                'description': self._get_wind_description(weather_data.wind_speed)
+            },
+            'visibility': weather_data.visibility,
+            'uv_index': weather_data.uv_index,
+            'cloud_cover': weather_data.cloud_cover,
+            'precipitation': {
+                'current': weather_data.precipitation,
+                'probability': weather_data.precipitation_probability
+            }
+        }
+    
+    def _get_precise_time_period(self, hour: int) -> str:
+        if 4 <= hour < 7:
+            return 'early_morning'
+        elif 7 <= hour < 11:
+            return 'morning'
+        elif 11 <= hour < 13:
+            return 'late_morning'
+        elif 13 <= hour < 17:
+            return 'afternoon'
+        elif 17 <= hour < 19:
+            return 'late_afternoon'
+        elif 19 <= hour < 22:
+            return 'evening'
+        else:
+            return 'night'
     
     def _get_time_period(self, hour: int) -> str:
         if 6 <= hour < 12:
@@ -1596,156 +1447,23 @@ class UltraWeatherService:
         else:
             return 'night'
     
-    def _get_precise_time_period(self, hour: int) -> str:
-        for period, (start, end) in self.time_periods.items():
-            if start <= hour < end or (period == 'night' and (hour >= 22 or hour < 4)):
-                return period
-        return 'morning'
-    
-    def _get_ultra_recommendations(self, condition: str, time_period: str, temperature: float, weather_data: WeatherData) -> Dict:
-        base_recommendations = self.ultra_recommendations.get(condition, {}).get(time_period, {})
-        
-        if not base_recommendations:
-            base_recommendations = self.ultra_recommendations.get('Clear', {}).get('morning', {})
-        
-        enhanced = json.loads(json.dumps(base_recommendations))
-        
-        if temperature > 35:
-            enhanced['health_safety']['safety_tips'].extend(['Extreme heat warning', 'Stay indoors during peak hours'])
-            enhanced['activities']['avoid'].extend(['Any outdoor activities', 'Direct sun exposure'])
-        elif temperature < -5:
-            enhanced['health_safety']['safety_tips'].extend(['Extreme cold warning', 'Limit outdoor exposure'])
-            enhanced['clothing']['recommended'].extend(['Extreme cold gear', 'Face protection'])
-        
-        return enhanced
-    
-    def _get_time_based_recommendations(self, condition: str, time_period: str, temperature: float) -> Dict:
-        base_recommendations = self.weather_recommendations.get(condition, {}).get(time_period, {})
-        
-        if not base_recommendations:
-            base_recommendations = self.weather_recommendations['Clear'][time_period]
-        
-        recommendations = base_recommendations.copy()
-        
-        if temperature > 30:
-            recommendations['activities'].extend(['Swimming', 'Water activities', 'Seek air conditioning'])
-            recommendations['clothing'].extend(['Lightweight fabrics', 'Cooling accessories'])
-            recommendations['health_tips'].extend(['Stay very hydrated', 'Avoid prolonged sun exposure'])
-        elif temperature < 0:
-            recommendations['activities'] = ['Indoor activities', 'Hot beverages', 'Warm shelter']
-            recommendations['clothing'].extend(['Heavy winter gear', 'Multiple layers', 'Thermal wear'])
-            recommendations['health_tips'].extend(['Protect from frostbite', 'Limit outdoor exposure'])
-        
-        return recommendations
-    
-    def _calculate_best_times_detailed(self, forecast_data: List[Dict]) -> Dict:
-        if not forecast_data:
-            return {}
-        
-        today_forecast = forecast_data[0] if forecast_data else None
-        if not today_forecast:
-            return {}
-        
-        time_periods = ['morning', 'afternoon', 'evening', 'night']
-        period_scores = {}
-        
-        for period in time_periods:
-            score = 50
-            temp_avg = today_forecast['temperature']['avg']
-            condition = today_forecast['condition']
-            wind_speed = today_forecast.get('wind_speed', 5)
-            humidity = today_forecast.get('humidity', 50)
-            uv_index = today_forecast.get('uv_index', 5)
-            
-            if period == 'morning':
-                if 15 <= temp_avg <= 25:
-                    score += 25
-                if condition == 'Clear':
-                    score += 20
-                if wind_speed < 10:
-                    score += 10
-                if humidity < 70:
-                    score += 5
-                reasons = [
-                    "Cool and comfortable temperatures",
-                    "Fresh air and energy",
-                    "Perfect for exercise",
-                    "Good visibility"
-                ]
-            
-            elif period == 'afternoon':
-                if 20 <= temp_avg <= 28:
-                    score += 20
-                elif temp_avg > 35:
-                    score -= 15
-                if condition in ['Clear', 'Clouds']:
-                    score += 15
-                if uv_index > 8:
-                    score -= 10
-                reasons = [
-                    "Peak daylight hours",
-                    "Warmest part of day",
-                    "Good for outdoor activities",
-                    "High energy period"
-                ]
-            
-            elif period == 'evening':
-                if 18 <= temp_avg <= 26:
-                    score += 25
-                if condition != 'Thunderstorm':
-                    score += 15
-                if wind_speed < 15:
-                    score += 10
-                reasons = [
-                    "Comfortable cooling temperatures",
-                    "Perfect for relaxation",
-                    "Beautiful lighting",
-                    "Social activities ideal"
-                ]
-            
-            else:
-                if 12 <= temp_avg <= 22:
-                    score += 20
-                if condition not in ['Thunderstorm', 'Rain']:
-                    score += 10
-                if humidity > 40:
-                    score += 5
-                reasons = [
-                    "Cool and peaceful",
-                    "Perfect for rest",
-                    "Low activity requirements",
-                    "Comfortable sleeping weather"
-                ]
-            
-            period_scores[period] = {
-                'score': max(0, min(100, score)),
-                'reasons': reasons[:3],
-                'temperature': temp_avg,
-                'condition': condition,
-                'recommendations': self._get_time_based_recommendations(condition, period, temp_avg)
-            }
-        
-        best_period = max(period_scores.keys(), key=lambda k: period_scores[k]['score'])
-        
-        period_times = {
-            'morning': '6:00 AM - 12:00 PM',
-            'afternoon': '12:00 PM - 6:00 PM',
-            'evening': '6:00 PM - 10:00 PM',
-            'night': '10:00 PM - 6:00 AM'
-        }
-        
-        return {
-            'best_period': best_period,
-            'best_time_range': period_times[best_period],
-            'score': period_scores[best_period]['score'],
-            'why_best': period_scores[best_period]['reasons'],
-            'all_periods': period_scores,
-            'detailed_analysis': {
-                'temperature_optimal': period_scores[best_period]['temperature'],
-                'weather_favorable': period_scores[best_period]['condition'],
-                'activity_suitability': 'High' if period_scores[best_period]['score'] > 75 else 'Moderate' if period_scores[best_period]['score'] > 50 else 'Low'
-            }
-        }
+    def _get_wind_description(self, wind_speed: float) -> str:
+        if wind_speed < 1:
+            return "Calm"
+        elif wind_speed < 5:
+            return "Light air"
+        elif wind_speed < 11:
+            return "Light breeze"
+        elif wind_speed < 19:
+            return "Gentle breeze"
+        elif wind_speed < 28:
+            return "Moderate breeze"
+        elif wind_speed < 38:
+            return "Fresh breeze"
+        elif wind_speed < 49:
+            return "Strong breeze"
+        else:
+            return "Strong winds"
     
     def _map_tomorrow_weather_code(self, code: int) -> Tuple[str, str, str]:
         code_map = {
@@ -1793,6 +1511,33 @@ class UltraWeatherService:
             return 'Mist'
         else:
             return 'Clear'
+    
+    async def _calculate_comprehensive_health_insights(self, weather: WeatherData, air_quality: Optional[AirQualityData]) -> HealthInsights:
+        temp = weather.temperature
+        humidity = weather.humidity
+        wind_speed = weather.wind_speed
+        uv_index = weather.uv_index
+        
+        heat_index = self._calculate_heat_index(temp, humidity)
+        wind_chill = self._calculate_wind_chill(temp, wind_speed)
+        
+        comfort_level = self._determine_comfort_level(temp, humidity, wind_speed)
+        hydration_advice = self._get_hydration_advice(temp, humidity)
+        exercise_advice = self._get_exercise_advice(temp, humidity, air_quality)
+        
+        health_tips = self._generate_comprehensive_health_tips(temp, humidity, uv_index, air_quality)
+        
+        return HealthInsights(
+            heat_index=heat_index,
+            wind_chill=wind_chill,
+            pollen_level='Unknown',
+            air_quality_advice=self._get_air_quality_advice(air_quality.aqi if air_quality else 1),
+            uv_advice=self._get_uv_advice(uv_index),
+            general_health_tips=health_tips,
+            comfort_level=comfort_level,
+            hydration_advice=hydration_advice,
+            exercise_advice=exercise_advice
+        )
     
     def _calculate_heat_index(self, temp: float, humidity: float) -> float:
         if temp < 27:
@@ -1931,20 +1676,6 @@ class UltraWeatherService:
         else:
             return "Air quality is hazardous - avoid outdoor activities"
     
-    def _get_enhanced_air_quality_advice(self, aqi: int) -> str:
-        if aqi <= 50:
-            return "Excellent air quality - enjoy unrestricted outdoor activities"
-        elif aqi <= 100:
-            return "Good air quality - suitable for all outdoor activities"
-        elif aqi <= 150:
-            return "Moderate air quality - sensitive individuals should reduce prolonged outdoor exertion"
-        elif aqi <= 200:
-            return "Unhealthy air quality - everyone should limit prolonged outdoor exertion"
-        elif aqi <= 300:
-            return "Very unhealthy air quality - avoid outdoor activities"
-        else:
-            return "Hazardous air quality - remain indoors with windows closed"
-    
     def _get_uv_advice(self, uv_index: float) -> str:
         if uv_index < 3:
             return "Low UV - minimal protection needed"
@@ -1957,26 +1688,201 @@ class UltraWeatherService:
         else:
             return "Extreme UV - avoid sun exposure"
     
-    def _get_wind_description(self, wind_speed: float) -> str:
-        if wind_speed < 1:
-            return "Calm"
-        elif wind_speed < 5:
-            return "Light air"
-        elif wind_speed < 11:
-            return "Light breeze"
-        elif wind_speed < 19:
-            return "Gentle breeze"
-        elif wind_speed < 28:
-            return "Moderate breeze"
-        elif wind_speed < 38:
-            return "Fresh breeze"
-        elif wind_speed < 49:
-            return "Strong breeze"
-        elif wind_speed < 61:
-            return "Near gale"
-        elif wind_speed < 74:
-            return "Gale"
-        else:
-            return "Strong gale"
+    def _get_time_based_recommendations(self, condition: str, time_period: str, temperature: float) -> Dict:
+        weather_recommendations = {
+            'Clear': {
+                'morning': {
+                    'activities': ['Jogging', 'Cycling', 'Outdoor yoga', 'Hiking'],
+                    'clothing': ['Light athletic wear', 'Sunglasses', 'Cap'],
+                    'health_tips': ['Apply sunscreen', 'Stay hydrated', 'Perfect for exercise']
+                },
+                'afternoon': {
+                    'activities': ['Swimming', 'Indoor activities', 'Shopping'],
+                    'clothing': ['Light clothing', 'Sun hat', 'UV protection'],
+                    'health_tips': ['Seek shade', 'Increase water intake', 'Avoid prolonged exposure']
+                },
+                'evening': {
+                    'activities': ['Walking', 'Outdoor dining', 'Social gatherings'],
+                    'clothing': ['Light layers', 'Comfortable wear'],
+                    'health_tips': ['Perfect time for exercise', 'Stay visible']
+                },
+                'night': {
+                    'activities': ['Reading', 'Relaxation', 'Sleep preparation'],
+                    'clothing': ['Comfortable indoor wear', 'Light layers'],
+                    'health_tips': ['Wind down', 'Prepare for rest']
+                }
+            },
+            'Clouds': {
+                'morning': {
+                    'activities': ['Running', 'Cycling', 'Any outdoor activity'],
+                    'clothing': ['Comfortable layers', 'Athletic wear'],
+                    'health_tips': ['Perfect conditions for exercise']
+                },
+                'afternoon': {
+                    'activities': ['Outdoor exploration', 'Sports', 'Walking'],
+                    'clothing': ['Casual layers', 'Comfortable clothing'],
+                    'health_tips': ['Ideal conditions for activities']
+                },
+                'evening': {
+                    'activities': ['Social gatherings', 'Walking', 'Events'],
+                    'clothing': ['Light layers', 'Casual options'],
+                    'health_tips': ['Excellent conditions']
+                },
+                'night': {
+                    'activities': ['Indoor activities', 'Relaxation'],
+                    'clothing': ['Comfortable layers', 'Cozy wear'],
+                    'health_tips': ['Good sleeping conditions']
+                }
+            },
+            'Rain': {
+                'morning': {
+                    'activities': ['Indoor exercise', 'Reading', 'Cozy indoor activities'],
+                    'clothing': ['Indoor comfortable wear'],
+                    'health_tips': ['Stay dry and warm']
+                },
+                'afternoon': {
+                    'activities': ['Indoor shopping', 'Museums', 'Movies'],
+                    'clothing': ['Comfortable indoor clothing'],
+                    'health_tips': ['Perfect for indoor activities']
+                },
+                'evening': {
+                    'activities': ['Reading', 'Movies', 'Relaxation'],
+                    'clothing': ['Cozy indoor wear'],
+                    'health_tips': ['Enjoy peaceful indoor time']
+                },
+                'night': {
+                    'activities': ['Sleep', 'Reading', 'Rest'],
+                    'clothing': ['Comfortable sleepwear'],
+                    'health_tips': ['Perfect sleeping weather']
+                }
+            }
+        }
+        
+        base_recommendations = weather_recommendations.get(condition, {}).get(time_period, {})
+        
+        if not base_recommendations:
+            base_recommendations = weather_recommendations['Clear'][time_period]
+        
+        recommendations = base_recommendations.copy()
+        
+        if temperature > 30:
+            recommendations['activities'] = ['Indoor activities', 'Swimming', 'Air-conditioned venues']
+            recommendations['clothing'].extend(['Cooling accessories', 'Light colors only'])
+            recommendations['health_tips'].extend(['Stay very hydrated', 'Avoid heat exposure'])
+        elif temperature < 0:
+            recommendations['activities'] = ['Indoor activities', 'Warm beverages', 'Cozy indoor time']
+            recommendations['clothing'].extend(['Heavy winter gear', 'Warm layers'])
+            recommendations['health_tips'].extend(['Stay warm', 'Limit outdoor exposure'])
+        
+        return recommendations
+    
+    def _calculate_best_times_detailed(self, forecast_data: List[Dict]) -> Dict:
+        if not forecast_data:
+            return {}
+        
+        today_forecast = forecast_data[0] if forecast_data else None
+        if not today_forecast:
+            return {}
+        
+        time_periods = ['morning', 'afternoon', 'evening', 'night']
+        period_scores = {}
+        
+        for period in time_periods:
+            score = 50
+            temp_avg = today_forecast['temperature']['avg']
+            condition = today_forecast['condition']
+            wind_speed = today_forecast.get('wind_speed', 5)
+            humidity = today_forecast.get('humidity', 50)
+            uv_index = today_forecast.get('uv_index', 5)
+            
+            if period == 'morning':
+                if 15 <= temp_avg <= 25:
+                    score += 25
+                if condition == 'Clear':
+                    score += 20
+                if wind_speed < 10:
+                    score += 10
+                if humidity < 70:
+                    score += 5
+                reasons = [
+                    "Cool and comfortable temperatures",
+                    "Fresh air and energy",
+                    "Perfect for exercise",
+                    "Good visibility"
+                ]
+            
+            elif period == 'afternoon':
+                if 20 <= temp_avg <= 28:
+                    score += 20
+                elif temp_avg > 35:
+                    score -= 15
+                if condition in ['Clear', 'Clouds']:
+                    score += 15
+                if uv_index > 8:
+                    score -= 10
+                reasons = [
+                    "Peak daylight hours",
+                    "Warmest part of day",
+                    "Good for outdoor activities",
+                    "High energy period"
+                ]
+            
+            elif period == 'evening':
+                if 18 <= temp_avg <= 26:
+                    score += 25
+                if condition != 'Thunderstorm':
+                    score += 15
+                if wind_speed < 15:
+                    score += 10
+                reasons = [
+                    "Comfortable cooling temperatures",
+                    "Perfect for relaxation",
+                    "Beautiful lighting",
+                    "Social activities ideal"
+                ]
+            
+            else:
+                if 12 <= temp_avg <= 22:
+                    score += 20
+                if condition not in ['Thunderstorm', 'Rain']:
+                    score += 10
+                if humidity > 40:
+                    score += 5
+                reasons = [
+                    "Cool and peaceful",
+                    "Perfect for rest",
+                    "Low activity requirements",
+                    "Comfortable sleeping weather"
+                ]
+            
+            period_scores[period] = {
+                'score': max(0, min(100, score)),
+                'reasons': reasons[:3],
+                'temperature': temp_avg,
+                'condition': condition,
+                'recommendations': self._get_time_based_recommendations(condition, period, temp_avg)
+            }
+        
+        best_period = max(period_scores.keys(), key=lambda k: period_scores[k]['score'])
+        
+        period_times = {
+            'morning': '6:00 AM - 12:00 PM',
+            'afternoon': '12:00 PM - 6:00 PM',
+            'evening': '6:00 PM - 10:00 PM',
+            'night': '10:00 PM - 6:00 AM'
+        }
+        
+        return {
+            'best_period': best_period,
+            'best_time_range': period_times[best_period],
+            'score': period_scores[best_period]['score'],
+            'why_best': period_scores[best_period]['reasons'],
+            'all_periods': period_scores,
+            'detailed_analysis': {
+                'temperature_optimal': period_scores[best_period]['temperature'],
+                'weather_favorable': period_scores[best_period]['condition'],
+                'activity_suitability': 'High' if period_scores[best_period]['score'] > 75 else 'Moderate' if period_scores[best_period]['score'] > 50 else 'Low'
+            }
+        }
 
 weather_service = UltraWeatherService()
